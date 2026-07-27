@@ -97,36 +97,35 @@ impl AuthorizationManager {
                     permissions_to_satisfy.insert(declared_auth.clone());
                 }
             }
-
-            let global_properties = unsafe { &*db.get_global_properties()? };
-            let chain_config = global_properties.get_chain_config();
-            let mut authority_checker = AuthorityChecker::new(
-                chain_config.get_max_authority_depth(),
-                provided_keys,
-                provided_permissions,
-                effective_provided_delay,
-            );
-
-            // Now verify that all the declared authorizations are satisfied
-            for p in permissions_to_satisfy.iter() {
-                let auth = Authority::new_from_permission_level(p);
-
-                pulse_assert(
-                    authority_checker.satisfied(db, &auth, 0)?,
-                    ChainError::AuthorizationError(format!(
-                        "transaction declares authority '{}' but does not have signatures for it",
-                        p
-                    )),
-                )?;
-            }
-
-            // Now verify that all the provided keys are used, otherwise we are wasting resources
-            if !authority_checker.all_keys_used() {
-                return Err(ChainError::AuthorizationError(
-                    "transaction bears irrelevant signatures".to_string(),
-                ));
-            }
         }
+
+        let mut authority_checker = AuthorityChecker::new(
+            chain_config.get_max_authority_depth(),
+            provided_keys,
+            provided_permissions,
+            effective_provided_delay,
+        );
+
+        // Now verify that all the declared authorizations are satisfied
+        for p in permissions_to_satisfy.iter() {
+            let auth = Authority::new_from_permission_level(p);
+
+            pulse_assert(
+                authority_checker.satisfied(db, &auth, 0)?,
+                ChainError::AuthorizationError(format!(
+                    "transaction declares authority '{}' but does not have signatures for it",
+                    p
+                )),
+            )?;
+        }
+
+        // Now verify that all the provided keys are used, otherwise we are wasting resources
+        if !authority_checker.all_keys_used() {
+            return Err(ChainError::AuthorizationError(
+                "transaction bears irrelevant signatures".to_string(),
+            ));
+        }
+
         Ok(())
     }
 
