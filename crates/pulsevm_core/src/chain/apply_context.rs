@@ -1044,6 +1044,17 @@ impl ApplyContext {
                 payer
             };
             self.db.update_index64_object(obj, new_payer, secondary)?;
+            // Re-point the arena row's secondary/payer too; the FFI update only
+            // touches chainbase, so an arena-served read would otherwise be stale.
+            #[cfg(feature = "arena-shadow")]
+            self.db.arena_update_index64(
+                table_obj.get_code().to_uint64_t(),
+                table_obj.get_scope().to_uint64_t(),
+                table_obj.get_table().to_uint64_t(),
+                obj.get_primary_key(),
+                new_payer,
+                secondary,
+            );
             (old_payer, new_payer)
         };
 
@@ -1440,6 +1451,15 @@ impl ApplyContext {
                 payer
             };
             self.db.update_index128_object(obj, new_payer, secondary)?;
+            #[cfg(feature = "arena-shadow")]
+            self.db.arena_update_index128(
+                table_obj.get_code().to_uint64_t(),
+                table_obj.get_scope().to_uint64_t(),
+                table_obj.get_table().to_uint64_t(),
+                obj.get_primary_key(),
+                new_payer,
+                secondary,
+            );
             (old_payer, new_payer)
         };
 
@@ -1816,6 +1836,17 @@ impl ApplyContext {
             } else {
                 payer
             };
+            // Mirror before the FFI update moves `secondary` (U256 is not Copy);
+            // the two writes are independent so order does not matter.
+            #[cfg(feature = "arena-shadow")]
+            self.db.arena_update_index256(
+                table_obj.get_code().to_uint64_t(),
+                table_obj.get_scope().to_uint64_t(),
+                table_obj.get_table().to_uint64_t(),
+                obj.get_primary_key(),
+                new_payer,
+                &secondary,
+            );
             self.db.update_index256_object(obj, new_payer, secondary)?;
             (old_payer, new_payer)
         };
@@ -2201,6 +2232,15 @@ impl ApplyContext {
             };
             self.db
                 .update_idx_double_object(obj, new_payer, secondary)?;
+            #[cfg(feature = "arena-shadow")]
+            self.db.arena_update_idx_double(
+                table_obj.get_code().to_uint64_t(),
+                table_obj.get_scope().to_uint64_t(),
+                table_obj.get_table().to_uint64_t(),
+                obj.get_primary_key(),
+                new_payer,
+                secondary,
+            );
             (old_payer, new_payer)
         };
 
@@ -2596,6 +2636,17 @@ impl ApplyContext {
             } else {
                 payer
             };
+            // Mirror before the FFI update moves `secondary` (Float128 is not
+            // Copy); the two writes are independent so order does not matter.
+            #[cfg(feature = "arena-shadow")]
+            self.db.arena_update_idx_long_double(
+                table_obj.get_code().to_uint64_t(),
+                table_obj.get_scope().to_uint64_t(),
+                table_obj.get_table().to_uint64_t(),
+                obj.get_primary_key(),
+                new_payer,
+                &secondary,
+            );
             self.db
                 .update_idx_long_double_object(obj, new_payer, secondary)?;
             (old_payer, new_payer)
