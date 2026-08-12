@@ -350,9 +350,8 @@ impl ApplyContext {
         let inherit_parent_authorizations = send_to_self && &self.receiver == action.account();
 
         {
-            let code = self.db.find_account(a.account().as_u64())?;
             pulse_assert(
-                !code.is_null(),
+                self.db.is_account(a.account().as_u64())?,
                 ChainError::TransactionError(format!(
                     "inline action's code account {} does not exist",
                     a.account()
@@ -362,9 +361,8 @@ impl ApplyContext {
             let mut inherited_authorizations: BTreeSet<PermissionLevel> = BTreeSet::new();
 
             for auth in a.authorization() {
-                let actor = self.db.find_account(auth.actor)?;
                 pulse_assert(
-                    !actor.is_null(),
+                    self.db.is_account(auth.actor)?,
                     ChainError::TransactionError(format!(
                         "inline action's authorizing actor {} does not exist",
                         auth.actor
@@ -411,9 +409,8 @@ impl ApplyContext {
     }
 
     pub fn execute_context_free_inline(&mut self, a: &Action) -> Result<(), ChainError> {
-        let code = self.db.find_account(a.account().as_u64())?;
         pulse_assert(
-            !code.is_null(),
+            self.db.is_account(a.account().as_u64())?,
             ChainError::TransactionError(format!(
                 "inline action's code account {} does not exist",
                 a.account()

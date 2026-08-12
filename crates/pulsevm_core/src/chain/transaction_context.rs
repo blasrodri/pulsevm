@@ -738,9 +738,7 @@ impl TransactionContext {
     pub fn validate_referenced_accounts(&self, trx: &Transaction) -> Result<(), ChainError> {
         if !trx.context_free_actions.is_empty() {
             for action in trx.context_free_actions.iter() {
-                let code = self.db.find_account(action.account.as_u64())?;
-
-                if code.is_null() {
+                if !self.db.is_account(action.account.as_u64())? {
                     return Err(ChainError::TransactionError(format!(
                         "context free action {} references non-existent account {}",
                         action.name(),
@@ -759,9 +757,7 @@ impl TransactionContext {
         let mut one_auth = false;
 
         for action in trx.actions.iter() {
-            let code = self.db.find_account(action.account.as_u64())?;
-
-            if code.is_null() {
+            if !self.db.is_account(action.account.as_u64())? {
                 return Err(ChainError::TransactionError(format!(
                     "action {} references non-existent account {}",
                     action.name(),
@@ -771,9 +767,7 @@ impl TransactionContext {
 
             for auth in action.authorization().iter() {
                 one_auth = true;
-                let actor = self.db.find_account(auth.actor())?;
-
-                if actor.is_null() {
+                if !self.db.is_account(auth.actor())? {
                     return Err(ChainError::TransactionError(format!(
                         "action's authorizing actor '{}' does not exist",
                         Name::new(auth.actor)

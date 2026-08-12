@@ -66,10 +66,7 @@ pub fn newaccount(
     )?;
 
     // Check if the creator is privileged
-    let creator = db.find_account_metadata(create.creator.as_u64())?;
-    let creator = unsafe { &*creator };
-
-    if !creator.is_privileged() {
+    if !db.is_account_privileged(create.creator.as_u64())? {
         pulse_assert(
             !name_str.starts_with("pulse."),
             ChainError::TransactionError(
@@ -78,9 +75,8 @@ pub fn newaccount(
         )?;
     }
 
-    let existing_account = db.find_account(create.name.as_u64())?;
     pulse_assert(
-        existing_account.is_null(),
+        !db.is_account(create.name.as_u64())?,
         ChainError::TransactionError(format!(
             "cannot create account named {}, as that name is already taken",
             create.name
