@@ -1163,7 +1163,20 @@ impl Controller {
                 Ok(digests)
             }
             Err(e) => {
-                warn!("onblock failed, skipping: {}", e);
+                // onblock is invoked speculatively at the head of every block, but
+                // whether the deployed system contract implements it is chain
+                // dependent. A contract with no onblock handler makes its dispatcher
+                // assert "unknown action" on the implicit call — expected on such a
+                // chain, so it is logged at debug rather than warned on every block.
+                // Any other failure (a genuine onblock bug with a different assert,
+                // or a machinery error) still warns. Either way the failure is
+                // deterministic and yields no action receipt, so every node agrees
+                // on the merkles and the block still forms.
+                if e.to_string().contains("unknown action") {
+                    debug!("onblock not implemented by the system contract, skipping");
+                } else {
+                    warn!("onblock failed, skipping: {}", e);
+                }
                 session.pin_mut().undo().map_err(|e| {
                     ChainError::DatabaseError(format!("failed to undo onblock: {}", e))
                 })?;
@@ -7739,6 +7752,78 @@ mod tests {
         assert!(
             !digests.is_empty(),
             "onblock must run the pulse contract to completion under a CPU limit of -1"
+        );
+
+        Ok(())
+    }
+
+    // A system contract that does not implement onblock (its dispatcher asserts
+    // "unknown action" on the implicit call, as the reference chain's does) must
+    // not break block production: run_onblock has to swallow the contract-level
+    // rejection, undo the child session, and return no digests — leaving pulse's
+    // receive sequence and the block CPU budget exactly where they were, so the
+    // block still forms with only its real transactions. This pins the harden-only
+    // invoke path: onblock is invoked every block but its absence is a clean no-op.
+    #[tokio::test]
+    async fn onblock_skipped_cleanly_when_contract_rejects_it() -> Result<(), ChainError> {
+        let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let status = BlockStatus::Building;
+
+        // A contract that rejects only the onblock action (so deploying it — a
+        // setcode action that also reaches apply — and any other action still
+        // succeed). This is exactly the shape of a system contract with no onblock
+        // handler: the dispatcher asserts "unknown action".
+        let onblock = ONBLOCK_NAME.as_u64() as i64;
+        let wasm = wat::parse_str(&format!(
+            r#"
+            (module
+              (import "env" "eosio_assert" (func $assert (param i32 i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 8) "unknown action\00")
+              (func (export "apply") (param i64 i64 i64)
+                (block $skip
+                  (br_if $skip (i64.ne (local.get 2) (i64.const {onblock})))
+                  (call $assert (i32.const 0) (i32.const 8)))))
+            "#,
+        ))
+        .unwrap();
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &ts,
+            &status,
+        )?;
+
+        let db = controller.database();
+        let recv_before = db
+            .get_account_metadata(PULSE_NAME.as_u64())?
+            .get_recv_sequence();
+        let cpu_before = db.get_block_cpu_limit()?;
+
+        // onblock is received by pulse, whose contract now asserts on it. The call
+        // must fail internally but run_onblock must return Ok with no digests.
+        let timestamp: BlockTimestamp = TimePoint::now().into();
+        let previous = controller.preferred_id;
+        let digests =
+            controller.run_onblock(&timestamp, PULSE_NAME, previous, &BlockStatus::Building)?;
+        assert!(
+            digests.is_empty(),
+            "a rejected onblock must yield no action-receipt digests"
+        );
+
+        // The undone child session leaves no trace: no receipt was minted (recv
+        // sequence unchanged) and nothing was billed to the block CPU budget.
+        assert_eq!(
+            db.get_account_metadata(PULSE_NAME.as_u64())?
+                .get_recv_sequence(),
+            recv_before,
+            "a skipped onblock must not advance pulse's receive sequence"
+        );
+        assert_eq!(
+            db.get_block_cpu_limit()?,
+            cpu_before,
+            "a skipped onblock must not consume block CPU"
         );
 
         Ok(())
