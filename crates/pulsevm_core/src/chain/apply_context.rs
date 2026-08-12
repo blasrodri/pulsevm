@@ -16,7 +16,6 @@ use pulsevm_billable_size::billable_size_v;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
-    AccountMetadataObject,
     BlockTimestamp,
     ChainConfigV0,
     Database,
@@ -237,7 +236,7 @@ impl ApplyContext {
             self.receiver.clone(),
             act_digest,
             self.next_global_sequence()?,
-            self.next_recv_sequence(&receiver_account)?,
+            self.next_recv_sequence(self.receiver.as_u64())?,
             BTreeMap::new(),
             first_receiver_account.get_code_sequence() as u32,
             first_receiver_account.get_abi_sequence() as u32,
@@ -2200,11 +2199,8 @@ impl ApplyContext {
         Ok(())
     }
 
-    pub fn next_recv_sequence(
-        &mut self,
-        receiver_account: &AccountMetadataObject,
-    ) -> Result<u64, ChainError> {
-        self.db.next_recv_sequence(receiver_account)
+    pub fn next_recv_sequence(&mut self, receiver: u64) -> Result<u64, ChainError> {
+        self.db.next_recv_sequence(receiver)
     }
 
     pub fn next_auth_sequence(&mut self, actor: u64) -> Result<u64, ChainError> {
