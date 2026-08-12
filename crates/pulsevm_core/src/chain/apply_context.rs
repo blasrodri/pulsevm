@@ -82,6 +82,14 @@ struct ApplyContextInner {
     // secondary-index type, so the arena mirrors each independently.
     #[cfg(feature = "arena-shadow")]
     arena_index64_cache: ArenaIteratorCache,
+    #[cfg(feature = "arena-shadow")]
+    arena_index128_cache: ArenaIteratorCache,
+    #[cfg(feature = "arena-shadow")]
+    arena_index256_cache: ArenaIteratorCache,
+    #[cfg(feature = "arena-shadow")]
+    arena_index_double_cache: ArenaIteratorCache,
+    #[cfg(feature = "arena-shadow")]
+    arena_index_long_double_cache: ArenaIteratorCache,
     cpu_limit: i64, // CPU limit for the current action
 }
 
@@ -145,6 +153,14 @@ impl ApplyContext {
                 arena_keyval_cache: ArenaIteratorCache::default(),
                 #[cfg(feature = "arena-shadow")]
                 arena_index64_cache: ArenaIteratorCache::default(),
+                #[cfg(feature = "arena-shadow")]
+                arena_index128_cache: ArenaIteratorCache::default(),
+                #[cfg(feature = "arena-shadow")]
+                arena_index256_cache: ArenaIteratorCache::default(),
+                #[cfg(feature = "arena-shadow")]
+                arena_index_double_cache: ArenaIteratorCache::default(),
+                #[cfg(feature = "arena-shadow")]
+                arena_index_long_double_cache: ArenaIteratorCache::default(),
                 cpu_limit,
             })),
         })
@@ -537,14 +553,16 @@ impl ApplyContext {
         self.db.arena_note_pos(arena_h == res);
     }
 
-    /// Mint the idx64 iterator handle for a find/bound result and cross-check it
-    /// against chainbase's `res`: `-1` when the table is absent, the landing row's
-    /// handle on a hit, otherwise the table's end iterator — mirroring
-    /// `cache_table` on every call then `add` on a hit, as the C++ oracle does.
+    /// Mint the secondary-index iterator handle for a find/bound result and
+    /// cross-check it against chainbase's `res`: `-1` when the table is absent,
+    /// the landing row's handle on a hit, otherwise the table's end iterator —
+    /// mirroring `cache_table` on every call then `add` on a hit, as the C++
+    /// oracle does. `cache` is the arena twin of the chainbase iterator cache for
+    /// this secondary-index type.
     #[cfg(feature = "arena-shadow")]
-    fn note_idx64_handle(
+    fn note_secondary_handle(
         &self,
-        inner: &mut ApplyContextInner,
+        cache: &mut ArenaIteratorCache,
         op: &str,
         code: u64,
         scope: u64,
@@ -555,9 +573,9 @@ impl ApplyContext {
         let arena_h = if res == -1 {
             -1
         } else {
-            let end = inner.arena_index64_cache.cache_table((code, scope, table));
+            let end = cache.cache_table((code, scope, table));
             if res >= 0 {
-                inner.arena_index64_cache.add((code, scope, table, primary))
+                cache.add((code, scope, table, primary))
             } else {
                 end
             }
@@ -1088,8 +1106,8 @@ impl ApplyContext {
             {
                 *primary = p;
             }
-            self.note_idx64_handle(
-                &mut inner,
+            self.note_secondary_handle(
+                &mut inner.arena_index64_cache,
                 "idx64:find_sec",
                 code,
                 scope,
@@ -1133,8 +1151,8 @@ impl ApplyContext {
             {
                 *secondary = s;
             }
-            self.note_idx64_handle(
-                &mut inner,
+            self.note_secondary_handle(
+                &mut inner.arena_index64_cache,
                 "idx64:find_pri",
                 code,
                 scope,
@@ -1187,7 +1205,15 @@ impl ApplyContext {
                 *primary = p;
                 *secondary = s;
             }
-            self.note_idx64_handle(&mut inner, "idx64:lb", code, scope, table, *primary, res);
+            self.note_secondary_handle(
+                &mut inner.arena_index64_cache,
+                "idx64:lb",
+                code,
+                scope,
+                table,
+                *primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -1229,7 +1255,15 @@ impl ApplyContext {
                 *primary = p;
                 *secondary = s;
             }
-            self.note_idx64_handle(&mut inner, "idx64:ub", code, scope, table, *primary, res);
+            self.note_secondary_handle(
+                &mut inner.arena_index64_cache,
+                "idx64:ub",
+                code,
+                scope,
+                table,
+                *primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -1341,6 +1375,8 @@ impl ApplyContext {
         primary_key: u64,
         secondary_key: u128,
     ) -> Result<i32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        let table_name = table;
         let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
         let table = unsafe { &*table };
         pulse_assert(
@@ -1357,7 +1393,22 @@ impl ApplyContext {
                 .create_index128_object(table, payer, primary_key, secondary_key)?;
             let obj = unsafe { &*obj };
             inner.index128_cache.cache_table(&table)?;
-            inner.index128_cache.add(obj)?
+            let handle = inner.index128_cache.add(obj)?;
+
+            #[cfg(feature = "arena-shadow")]
+            {
+                let code = self.receiver.as_u64();
+                inner
+                    .arena_index128_cache
+                    .cache_table((code, scope, table_name));
+                let arena_h =
+                    inner
+                        .arena_index128_cache
+                        .add((code, scope, table_name, primary_key));
+                self.note_iter_handle("idx128:store", code, scope, table_name, arena_h, handle);
+            }
+
+            handle
         };
 
         let billable_size = billable_size_v::<Index128Object>() as i64;
@@ -1408,6 +1459,8 @@ impl ApplyContext {
                 iterator,
                 self.receiver.as_u64(),
             )?;
+            #[cfg(feature = "arena-shadow")]
+            inner.arena_index128_cache.remove(iterator);
         }
 
         self.update_db_usage(
@@ -1449,6 +1502,15 @@ impl ApplyContext {
             {
                 *primary = p;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index128_cache,
+                "idx128:find_sec",
+                code,
+                scope,
+                table,
+                *primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -1485,6 +1547,15 @@ impl ApplyContext {
             {
                 *secondary = s;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index128_cache,
+                "idx128:find_pri",
+                code,
+                scope,
+                table,
+                primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -1526,6 +1597,15 @@ impl ApplyContext {
                 *primary = p;
                 *secondary = s;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index128_cache,
+                "idx128:lb",
+                code,
+                scope,
+                table,
+                *primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -1567,6 +1647,15 @@ impl ApplyContext {
                 *primary = p;
                 *secondary = s;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index128_cache,
+                "idx128:ub",
+                code,
+                scope,
+                table,
+                *primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -1574,14 +1663,46 @@ impl ApplyContext {
 
     pub fn db_idx128_end(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx128_end(&mut inner.index128_cache, code, scope, table)
+        let res = self
+            .db
+            .db_idx128_end(&mut inner.index128_cache, code, scope, table)?;
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if res == -1 {
+                -1
+            } else {
+                inner.arena_index128_cache.cache_table((code, scope, table))
+            };
+            self.note_iter_handle("idx128:end", code, scope, table, arena_h, res);
+        }
+        Ok(res)
     }
 
     pub fn db_idx128_next(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx128_next(&mut inner.index128_cache, iterator, primary)
+        let res = self
+            .db
+            .db_idx128_next(&mut inner.index128_cache, iterator, primary)?;
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if iterator < -1 {
+                -1
+            } else if let Some((code, scope, table, cur)) =
+                inner.arena_index128_cache.row_of(iterator)
+            {
+                match self.db.arena_idx128_next(code, scope, table, cur) {
+                    Some(np) => {
+                        self.db.arena_note_pos(res < 0 || np == *primary);
+                        inner.arena_index128_cache.add((code, scope, table, np))
+                    }
+                    None => inner.arena_index128_cache.cache_table((code, scope, table)),
+                }
+            } else {
+                res
+            };
+            self.note_iter_handle("idx128:next", 0, 0, 0, arena_h, res);
+        }
+        Ok(res)
     }
 
     pub fn db_idx128_previous(
@@ -1590,8 +1711,37 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx128_previous(&mut inner.index128_cache, iterator, primary)
+        let res = self
+            .db
+            .db_idx128_previous(&mut inner.index128_cache, iterator, primary)?;
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if let Some((code, scope, table)) =
+                inner.arena_index128_cache.table_of_end(iterator)
+            {
+                match self.db.arena_idx128_last(code, scope, table) {
+                    Some(lp) => {
+                        self.db.arena_note_pos(res < 0 || lp == *primary);
+                        inner.arena_index128_cache.add((code, scope, table, lp))
+                    }
+                    None => -1,
+                }
+            } else if let Some((code, scope, table, cur)) =
+                inner.arena_index128_cache.row_of(iterator)
+            {
+                match self.db.arena_idx128_previous(code, scope, table, cur) {
+                    Some(pp) => {
+                        self.db.arena_note_pos(res < 0 || pp == *primary);
+                        inner.arena_index128_cache.add((code, scope, table, pp))
+                    }
+                    None => -1,
+                }
+            } else {
+                res
+            };
+            self.note_iter_handle("idx128:prev", 0, 0, 0, arena_h, res);
+        }
+        Ok(res)
     }
 
     pub fn db_idx256_store(
@@ -1602,6 +1752,8 @@ impl ApplyContext {
         primary_key: u64,
         secondary_key: U256,
     ) -> Result<i32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        let table_name = table;
         let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
         let table = unsafe { &*table };
         pulse_assert(
@@ -1618,7 +1770,22 @@ impl ApplyContext {
                 .create_index256_object(table, payer, primary_key, secondary_key)?;
             let obj = unsafe { &*obj };
             inner.index256_cache.cache_table(&table)?;
-            inner.index256_cache.add(obj)?
+            let handle = inner.index256_cache.add(obj)?;
+
+            #[cfg(feature = "arena-shadow")]
+            {
+                let code = self.receiver.as_u64();
+                inner
+                    .arena_index256_cache
+                    .cache_table((code, scope, table_name));
+                let arena_h =
+                    inner
+                        .arena_index256_cache
+                        .add((code, scope, table_name, primary_key));
+                self.note_iter_handle("idx256:store", code, scope, table_name, arena_h, handle);
+            }
+
+            handle
         };
 
         let billable_size = billable_size_v::<Index256Object>() as i64;
@@ -1669,6 +1836,8 @@ impl ApplyContext {
                 iterator,
                 self.receiver.as_u64(),
             )?;
+            #[cfg(feature = "arena-shadow")]
+            inner.arena_index256_cache.remove(iterator);
         }
 
         self.update_db_usage(
@@ -1712,6 +1881,15 @@ impl ApplyContext {
             {
                 *primary = p;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index256_cache,
+                "idx256:find_sec",
+                code,
+                scope,
+                table,
+                *primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -1752,6 +1930,15 @@ impl ApplyContext {
             {
                 secondary.value = b;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index256_cache,
+                "idx256:find_pri",
+                code,
+                scope,
+                table,
+                primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -1793,6 +1980,15 @@ impl ApplyContext {
                 *primary = p;
                 secondary.value = b;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index256_cache,
+                "idx256:lb",
+                code,
+                scope,
+                table,
+                *primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -1834,6 +2030,15 @@ impl ApplyContext {
                 *primary = p;
                 secondary.value = b;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index256_cache,
+                "idx256:ub",
+                code,
+                scope,
+                table,
+                *primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -1841,14 +2046,46 @@ impl ApplyContext {
 
     pub fn db_idx256_end(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx256_end(&mut inner.index256_cache, code, scope, table)
+        let res = self
+            .db
+            .db_idx256_end(&mut inner.index256_cache, code, scope, table)?;
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if res == -1 {
+                -1
+            } else {
+                inner.arena_index256_cache.cache_table((code, scope, table))
+            };
+            self.note_iter_handle("idx256:end", code, scope, table, arena_h, res);
+        }
+        Ok(res)
     }
 
     pub fn db_idx256_next(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx256_next(&mut inner.index256_cache, iterator, primary)
+        let res = self
+            .db
+            .db_idx256_next(&mut inner.index256_cache, iterator, primary)?;
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if iterator < -1 {
+                -1
+            } else if let Some((code, scope, table, cur)) =
+                inner.arena_index256_cache.row_of(iterator)
+            {
+                match self.db.arena_idx256_next(code, scope, table, cur) {
+                    Some(np) => {
+                        self.db.arena_note_pos(res < 0 || np == *primary);
+                        inner.arena_index256_cache.add((code, scope, table, np))
+                    }
+                    None => inner.arena_index256_cache.cache_table((code, scope, table)),
+                }
+            } else {
+                res
+            };
+            self.note_iter_handle("idx256:next", 0, 0, 0, arena_h, res);
+        }
+        Ok(res)
     }
 
     pub fn db_idx256_previous(
@@ -1857,8 +2094,37 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx256_previous(&mut inner.index256_cache, iterator, primary)
+        let res = self
+            .db
+            .db_idx256_previous(&mut inner.index256_cache, iterator, primary)?;
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if let Some((code, scope, table)) =
+                inner.arena_index256_cache.table_of_end(iterator)
+            {
+                match self.db.arena_idx256_last(code, scope, table) {
+                    Some(lp) => {
+                        self.db.arena_note_pos(res < 0 || lp == *primary);
+                        inner.arena_index256_cache.add((code, scope, table, lp))
+                    }
+                    None => -1,
+                }
+            } else if let Some((code, scope, table, cur)) =
+                inner.arena_index256_cache.row_of(iterator)
+            {
+                match self.db.arena_idx256_previous(code, scope, table, cur) {
+                    Some(pp) => {
+                        self.db.arena_note_pos(res < 0 || pp == *primary);
+                        inner.arena_index256_cache.add((code, scope, table, pp))
+                    }
+                    None => -1,
+                }
+            } else {
+                res
+            };
+            self.note_iter_handle("idx256:prev", 0, 0, 0, arena_h, res);
+        }
+        Ok(res)
     }
 
     pub fn db_idx_double_store(
@@ -1869,6 +2135,8 @@ impl ApplyContext {
         primary_key: u64,
         secondary_key: u64,
     ) -> Result<i32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        let table_name = table;
         let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
         let table = unsafe { &*table };
         pulse_assert(
@@ -1885,7 +2153,22 @@ impl ApplyContext {
                 .create_idx_double_object(table, payer, primary_key, secondary_key)?;
             let obj = unsafe { &*obj };
             inner.index_double_cache.cache_table(&table)?;
-            inner.index_double_cache.add(obj)?
+            let handle = inner.index_double_cache.add(obj)?;
+
+            #[cfg(feature = "arena-shadow")]
+            {
+                let code = self.receiver.as_u64();
+                inner
+                    .arena_index_double_cache
+                    .cache_table((code, scope, table_name));
+                let arena_h =
+                    inner
+                        .arena_index_double_cache
+                        .add((code, scope, table_name, primary_key));
+                self.note_iter_handle("idxdbl:store", code, scope, table_name, arena_h, handle);
+            }
+
+            handle
         };
 
         let billable_size = billable_size_v::<IndexDoubleObject>() as i64;
@@ -1937,6 +2220,8 @@ impl ApplyContext {
                 iterator,
                 self.receiver.as_u64(),
             )?;
+            #[cfg(feature = "arena-shadow")]
+            inner.arena_index_double_cache.remove(iterator);
         }
 
         self.update_db_usage(
@@ -1978,6 +2263,15 @@ impl ApplyContext {
             {
                 *primary = p;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index_double_cache,
+                "idxdbl:find_sec",
+                code,
+                scope,
+                table,
+                *primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -2014,6 +2308,15 @@ impl ApplyContext {
             {
                 *secondary = s;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index_double_cache,
+                "idxdbl:find_pri",
+                code,
+                scope,
+                table,
+                primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -2057,6 +2360,15 @@ impl ApplyContext {
                 *primary = p;
                 *secondary = s;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index_double_cache,
+                "idxdbl:lb",
+                code,
+                scope,
+                table,
+                *primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -2100,6 +2412,15 @@ impl ApplyContext {
                 *primary = p;
                 *secondary = s;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index_double_cache,
+                "idxdbl:ub",
+                code,
+                scope,
+                table,
+                *primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -2112,8 +2433,21 @@ impl ApplyContext {
         table: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx_double_end(&mut inner.index_double_cache, code, scope, table)
+        let res = self
+            .db
+            .db_idx_double_end(&mut inner.index_double_cache, code, scope, table)?;
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if res == -1 {
+                -1
+            } else {
+                inner
+                    .arena_index_double_cache
+                    .cache_table((code, scope, table))
+            };
+            self.note_iter_handle("idxdbl:end", code, scope, table, arena_h, res);
+        }
+        Ok(res)
     }
 
     pub fn db_idx_double_next(
@@ -2122,8 +2456,31 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx_double_next(&mut inner.index_double_cache, iterator, primary)
+        let res = self
+            .db
+            .db_idx_double_next(&mut inner.index_double_cache, iterator, primary)?;
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if iterator < -1 {
+                -1
+            } else if let Some((code, scope, table, cur)) =
+                inner.arena_index_double_cache.row_of(iterator)
+            {
+                match self.db.arena_idx_double_next(code, scope, table, cur) {
+                    Some(np) => {
+                        self.db.arena_note_pos(res < 0 || np == *primary);
+                        inner.arena_index_double_cache.add((code, scope, table, np))
+                    }
+                    None => inner
+                        .arena_index_double_cache
+                        .cache_table((code, scope, table)),
+                }
+            } else {
+                res
+            };
+            self.note_iter_handle("idxdbl:next", 0, 0, 0, arena_h, res);
+        }
+        Ok(res)
     }
 
     pub fn db_idx_double_previous(
@@ -2132,8 +2489,37 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx_double_previous(&mut inner.index_double_cache, iterator, primary)
+        let res =
+            self.db
+                .db_idx_double_previous(&mut inner.index_double_cache, iterator, primary)?;
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if let Some((code, scope, table)) =
+                inner.arena_index_double_cache.table_of_end(iterator)
+            {
+                match self.db.arena_idx_double_last(code, scope, table) {
+                    Some(lp) => {
+                        self.db.arena_note_pos(res < 0 || lp == *primary);
+                        inner.arena_index_double_cache.add((code, scope, table, lp))
+                    }
+                    None => -1,
+                }
+            } else if let Some((code, scope, table, cur)) =
+                inner.arena_index_double_cache.row_of(iterator)
+            {
+                match self.db.arena_idx_double_previous(code, scope, table, cur) {
+                    Some(pp) => {
+                        self.db.arena_note_pos(res < 0 || pp == *primary);
+                        inner.arena_index_double_cache.add((code, scope, table, pp))
+                    }
+                    None => -1,
+                }
+            } else {
+                res
+            };
+            self.note_iter_handle("idxdbl:prev", 0, 0, 0, arena_h, res);
+        }
+        Ok(res)
     }
 
     pub fn db_idx_long_double_store(
@@ -2144,6 +2530,8 @@ impl ApplyContext {
         primary_key: u64,
         secondary_key: Float128,
     ) -> Result<i32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        let table_name = table;
         let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
         let table = unsafe { &*table };
         pulse_assert(
@@ -2160,7 +2548,22 @@ impl ApplyContext {
                     .create_idx_long_double_object(table, payer, primary_key, secondary_key)?;
             let obj = unsafe { &*obj };
             inner.index_long_double_cache.cache_table(&table)?;
-            inner.index_long_double_cache.add(obj)?
+            let handle = inner.index_long_double_cache.add(obj)?;
+
+            #[cfg(feature = "arena-shadow")]
+            {
+                let code = self.receiver.as_u64();
+                inner
+                    .arena_index_long_double_cache
+                    .cache_table((code, scope, table_name));
+                let arena_h =
+                    inner
+                        .arena_index_long_double_cache
+                        .add((code, scope, table_name, primary_key));
+                self.note_iter_handle("idxldbl:store", code, scope, table_name, arena_h, handle);
+            }
+
+            handle
         };
 
         let billable_size = billable_size_v::<IndexLongDoubleObject>() as i64;
@@ -2214,6 +2617,8 @@ impl ApplyContext {
                 iterator,
                 self.receiver.as_u64(),
             )?;
+            #[cfg(feature = "arena-shadow")]
+            inner.arena_index_long_double_cache.remove(iterator);
         }
 
         self.update_db_usage(
@@ -2257,6 +2662,15 @@ impl ApplyContext {
             {
                 *primary = p;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index_long_double_cache,
+                "idxldbl:find_sec",
+                code,
+                scope,
+                table,
+                *primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -2298,6 +2712,15 @@ impl ApplyContext {
                 secondary.lo = lo;
                 secondary.hi = hi;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index_long_double_cache,
+                "idxldbl:find_pri",
+                code,
+                scope,
+                table,
+                primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -2342,6 +2765,15 @@ impl ApplyContext {
                 secondary.lo = lo;
                 secondary.hi = hi;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index_long_double_cache,
+                "idxldbl:lb",
+                code,
+                scope,
+                table,
+                *primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -2386,6 +2818,15 @@ impl ApplyContext {
                 secondary.lo = lo;
                 secondary.hi = hi;
             }
+            self.note_secondary_handle(
+                &mut inner.arena_index_long_double_cache,
+                "idxldbl:ub",
+                code,
+                scope,
+                table,
+                *primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -2398,8 +2839,24 @@ impl ApplyContext {
         table: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx_long_double_end(&mut inner.index_long_double_cache, code, scope, table)
+        let res = self.db.db_idx_long_double_end(
+            &mut inner.index_long_double_cache,
+            code,
+            scope,
+            table,
+        )?;
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if res == -1 {
+                -1
+            } else {
+                inner
+                    .arena_index_long_double_cache
+                    .cache_table((code, scope, table))
+            };
+            self.note_iter_handle("idxldbl:end", code, scope, table, arena_h, res);
+        }
+        Ok(res)
     }
 
     pub fn db_idx_long_double_next(
@@ -2408,8 +2865,35 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx_long_double_next(&mut inner.index_long_double_cache, iterator, primary)
+        let res = self.db.db_idx_long_double_next(
+            &mut inner.index_long_double_cache,
+            iterator,
+            primary,
+        )?;
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if iterator < -1 {
+                -1
+            } else if let Some((code, scope, table, cur)) =
+                inner.arena_index_long_double_cache.row_of(iterator)
+            {
+                match self.db.arena_idx_long_double_next(code, scope, table, cur) {
+                    Some(np) => {
+                        self.db.arena_note_pos(res < 0 || np == *primary);
+                        inner
+                            .arena_index_long_double_cache
+                            .add((code, scope, table, np))
+                    }
+                    None => inner
+                        .arena_index_long_double_cache
+                        .cache_table((code, scope, table)),
+                }
+            } else {
+                res
+            };
+            self.note_iter_handle("idxldbl:next", 0, 0, 0, arena_h, res);
+        }
+        Ok(res)
     }
 
     pub fn db_idx_long_double_previous(
@@ -2418,8 +2902,46 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx_long_double_previous(&mut inner.index_long_double_cache, iterator, primary)
+        let res = self.db.db_idx_long_double_previous(
+            &mut inner.index_long_double_cache,
+            iterator,
+            primary,
+        )?;
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if let Some((code, scope, table)) =
+                inner.arena_index_long_double_cache.table_of_end(iterator)
+            {
+                match self.db.arena_idx_long_double_last(code, scope, table) {
+                    Some(lp) => {
+                        self.db.arena_note_pos(res < 0 || lp == *primary);
+                        inner
+                            .arena_index_long_double_cache
+                            .add((code, scope, table, lp))
+                    }
+                    None => -1,
+                }
+            } else if let Some((code, scope, table, cur)) =
+                inner.arena_index_long_double_cache.row_of(iterator)
+            {
+                match self
+                    .db
+                    .arena_idx_long_double_previous(code, scope, table, cur)
+                {
+                    Some(pp) => {
+                        self.db.arena_note_pos(res < 0 || pp == *primary);
+                        inner
+                            .arena_index_long_double_cache
+                            .add((code, scope, table, pp))
+                    }
+                    None => -1,
+                }
+            } else {
+                res
+            };
+            self.note_iter_handle("idxldbl:prev", 0, 0, 0, arena_h, res);
+        }
+        Ok(res)
     }
 
     pub fn find_table(
