@@ -149,10 +149,10 @@ pub enum RangeDependency {
 
 /// Dependencies observed while executing one serial transaction.
 ///
-/// `complete` remains deliberately false: known contract and system-state paths
-/// are recorded, but a versioned private overlay and independent call-path audit
-/// do not exist yet. An optimistic commit implementation must reject incomplete
-/// reports.
+/// Serial telemetry leaves `complete` false. The closed, typed speculative
+/// overlay marks it true only when execution used exclusively supported logical
+/// operations; any unsupported path keeps the report incomplete. An optimistic
+/// commit implementation must reject incomplete reports.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TransactionDependencies {
     exact_reads: BTreeSet<DependencyKey>,
@@ -255,6 +255,12 @@ impl DependencyRecorder {
     pub(crate) fn write(&self, key: DependencyKey) {
         if let Ok(mut report) = self.inner.lock() {
             report.writes.insert(key);
+        }
+    }
+
+    pub(crate) fn mark_complete(&self) {
+        if let Ok(mut report) = self.inner.lock() {
+            report.complete = true;
         }
     }
 

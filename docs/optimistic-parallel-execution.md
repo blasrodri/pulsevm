@@ -122,14 +122,44 @@ counters. Permission-tree walks and due-deferred scans use conservative range
 keys. Exact logical keys deliberately coarsen pending/committed resource limits
 and singleton state where field-level merging has not been proven safe.
 
-Reports still intentionally set `complete = false`, so no optimistic commit
-path may accept them. The remaining safety boundary is not another known Arena
-table: it is the missing versioned snapshot/private overlay, ordered changeset
-application, and an independent call-path audit proving that future execution
-cannot bypass the recorder. Global action receipt sequencing and per-block
-resource usage are conservative singleton writes, so they currently conflict
-across transactions; safe ordered rebasing or aggregation is required before
-telemetry can translate into useful parallel commits.
+Serial telemetry reports still intentionally set `complete = false`, so they
+cannot authorize an optimistic commit. They measure working sets but do not run
+through the typed overlay described below, and an independent call-path audit
+must still prove future execution cannot bypass either dependency recording or
+private writes. Global action receipt sequencing and per-block resource usage
+are conservative singleton writes, so they currently conflict across
+transactions; safe ordered rebasing or aggregation is required before telemetry
+can translate into useful parallel commits.
+
+### Contract-primary overlay foundation
+
+The database now also exposes a default-off, typed speculation wave for the
+first bounded overlay slice. Starting a wave mutably borrows the controller's
+canonical `Database`, freezing that handle while workers receive cloneable
+read-only snapshots. Because Arena does not yet provide MVCC or copy-on-write
+snapshots, the snapshot shares the frozen store and carries both the Arena
+revision and a lazily installed logical-mutation epoch. Reads check the epoch
+before and after touching Arena; any write through an instrumented alias makes
+the snapshot stale and prevents commit. Nodes that never start a wave do not
+install the atomic epoch and retain the normal write path.
+
+Worker overlays currently expose only exact contract-primary get/create/update/
+remove operations. Writes remain private ordered logical operations keyed by
+`(code, scope, table, primary)`; they never contain Arena object ids or blob
+references. Ordered apply validates snapshot version, completeness, and prior
+writes, then invokes the live logical database API inside a nested undo session,
+so Arena assigns ids in canonical transaction/operation order. Secondary
+indices, range iteration, and every system-state operation are unsupported in
+this slice and must mark the worker result incomplete for serial re-execution.
+After any serial fallback, the conservative implementation invalidates the
+remaining wave rather than letting results from the old prefix commit.
+
+This API is not wired into block execution. Before that integration, every
+transaction database mutation must be routed through the typed overlay, the
+mutation-epoch bypass audit must cover lifecycle/state-replacement methods, and
+global receipt/resource singletons need an ordered rebase strategy. An Arena
+MVCC/COW read view would eventually replace the controller freeze invariant,
+but a full state clone per block is explicitly not an acceptable substitute.
 
 Required gates include unit tests for exact keys and range phantoms, inline
 actions, authorization changes, contract upgrades, RAM exhaustion, deferred

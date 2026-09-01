@@ -15,9 +15,17 @@ pub use crate::pod::{
 
 pub use crate::{
     database::{
+        BlockReadSnapshot,
+        ContractPrimaryKey,
+        ContractPrimaryOverlay,
         Database,
         DbRead,
         PermissionInfo,
+        SnapshotVersion,
+        SpeculativeCommitOutcome,
+        SpeculativeFallbackReason,
+        SpeculativeTransaction,
+        SpeculativeWave,
         SystemAccountNames,
         restore_snapshot,
     },

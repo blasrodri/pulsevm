@@ -14,6 +14,11 @@ use std::{
         Arc,
         Mutex,
         OnceLock,
+        atomic::{
+            AtomicBool,
+            AtomicU64,
+            Ordering,
+        },
     },
 };
 
@@ -592,6 +597,19 @@ fn authority_blob_billable_size(blob: &[u8]) -> Option<i64> {
 
 type ProtocolActivationRecord = ([u8; 32], u32);
 
+mod speculation;
+
+pub use speculation::{
+    BlockReadSnapshot,
+    ContractPrimaryKey,
+    ContractPrimaryOverlay,
+    SnapshotVersion,
+    SpeculativeCommitOutcome,
+    SpeculativeFallbackReason,
+    SpeculativeTransaction,
+    SpeculativeWave,
+};
+
 #[derive(Clone)]
 pub struct Database {
     /// The directory the arena persists into, kept so snapshots can checkpoint
@@ -614,6 +632,13 @@ pub struct Database {
     /// Present only on an opt-in transaction-local clone. The recorder is not
     /// part of Arena state and failures to record are intentionally ignored.
     dependency_recorder: Option<DependencyRecorder>,
+    /// Installed lazily by the default-off speculative-wave API. Normal nodes
+    /// pay only an unset `OnceLock` branch; once installed, logical writes bump
+    /// the shared epoch so stale read snapshots can never commit.
+    speculation_epoch: Arc<OnceLock<AtomicU64>>,
+    /// Guards the currently supported live contract-primary write surface while
+    /// a speculative wave owns the canonical controller handle.
+    speculation_freeze: Arc<AtomicBool>,
 }
 
 /// The staged arena checkpoint file used to move a snapshot through the transport
@@ -711,6 +736,8 @@ impl Database {
             native_system_contract_locked: metadata.is_some(),
             protocol_records: Arc::new(Mutex::new(protocol_records)),
             dependency_recorder: None,
+            speculation_epoch: Arc::new(OnceLock::new()),
+            speculation_freeze: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -765,6 +792,7 @@ impl Database {
         index: ContractIndex,
         primary: u64,
     ) {
+        self.bump_speculation_epoch();
         if let Some(recorder) = &self.dependency_recorder {
             recorder.write(DependencyKey::Contract(ContractRowKey::new(
                 code, scope, table, index, primary,
@@ -773,6 +801,7 @@ impl Database {
     }
 
     fn dependency_table_write(&self, code: u64, scope: u64, table: u64) {
+        self.bump_speculation_epoch();
         if let Some(recorder) = &self.dependency_recorder {
             recorder.write(DependencyKey::Contract(ContractRowKey::table(
                 code, scope, table,
@@ -793,9 +822,26 @@ impl Database {
     }
 
     fn dependency_system_write(&self, key: SystemKey) {
+        self.bump_speculation_epoch();
         if let Some(recorder) = &self.dependency_recorder {
             recorder.write(DependencyKey::System(key));
         }
+    }
+
+    fn bump_speculation_epoch(&self) {
+        if let Some(epoch) = self.speculation_epoch.get() {
+            epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn ensure_contract_primary_not_frozen(&self) -> Result<(), ChainError> {
+        if self.speculation_epoch.get().is_some() && self.speculation_freeze.load(Ordering::Acquire)
+        {
+            return Err(ChainError::DatabaseError(
+                "canonical contract-primary mutation attempted during a speculative wave".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Set the system-account identity used by runtime helpers. This is node
@@ -3426,6 +3472,19 @@ impl Database {
         primary_key: u64,
         buffer: &[u8],
     ) -> Result<(), ChainError> {
+        self.ensure_contract_primary_not_frozen()?;
+        self.apply_speculative_primary_create(code, scope, table, payer, primary_key, buffer)
+    }
+
+    fn apply_speculative_primary_create(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary_key: u64,
+        buffer: &[u8],
+    ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
         let s = &self.backend;
@@ -3443,6 +3502,19 @@ impl Database {
         payer: u64,
         buffer: &[u8],
     ) -> Result<(), ChainError> {
+        self.ensure_contract_primary_not_frozen()?;
+        self.apply_speculative_primary_update(code, scope, table, primary_key, payer, buffer)
+    }
+
+    fn apply_speculative_primary_update(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        buffer: &[u8],
+    ) -> Result<(), ChainError> {
         self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
         let s = &self.backend;
         s.update_key_value_object(code, scope, table, primary_key, payer, buffer)
@@ -3452,6 +3524,17 @@ impl Database {
     /// Remove a contract row in the arena alone (no chainbase). The arena drops
     /// the row and auto-removes the table when it empties, matching chainbase.
     pub fn remove_key_value_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Result<(), ChainError> {
+        self.ensure_contract_primary_not_frozen()?;
+        self.apply_speculative_primary_remove(code, scope, table, primary_key)
+    }
+
+    fn apply_speculative_primary_remove(
         &self,
         code: u64,
         scope: u64,
@@ -6011,6 +6094,8 @@ impl Default for Database {
             native_system_contract_locked: false,
             protocol_records: Arc::new(Mutex::new(Vec::new())),
             dependency_recorder: None,
+            speculation_epoch: Arc::new(OnceLock::new()),
+            speculation_freeze: Arc::new(AtomicBool::new(false)),
         }
     }
 }
