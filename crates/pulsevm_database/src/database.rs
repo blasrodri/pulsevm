@@ -36,6 +36,13 @@ use crate::{
     PermissionObject,
     Ratio,
     U256,
+    dependency::{
+        ContractIndex,
+        ContractRangeKey,
+        ContractRowKey,
+        DependencyRecorder,
+        DependencyTracker,
+    },
 };
 
 /// The RAM a `permission_link_object` is billed:
@@ -600,6 +607,9 @@ pub struct Database {
     /// are deterministic state derived from accepted upgrade heights and must
     /// survive restart even though they are not contract-table rows.
     protocol_records: Arc<Mutex<Vec<ProtocolActivationRecord>>>,
+    /// Present only on an opt-in transaction-local clone. The recorder is not
+    /// part of Arena state and failures to record are intentionally ignored.
+    dependency_recorder: Option<DependencyRecorder>,
 }
 
 /// The staged arena checkpoint file used to move a snapshot through the transport
@@ -696,7 +706,64 @@ impl Database {
                 .is_none_or(|metadata| metadata.native_system_contract),
             native_system_contract_locked: metadata.is_some(),
             protocol_records: Arc::new(Mutex::new(protocol_records)),
+            dependency_recorder: None,
         })
+    }
+
+    /// Clone this database handle with an isolated dependency recorder.
+    ///
+    /// Arena state remains shared exactly as for a normal clone. Only the
+    /// observation sidecar is new, and every subsequent clone of the returned
+    /// handle contributes to the same transaction-local report.
+    pub fn clone_with_dependency_tracking(&self) -> (Self, DependencyTracker) {
+        let tracker = DependencyTracker::new();
+        let mut database = self.clone();
+        database.dependency_recorder = Some(tracker.recorder());
+        (database, tracker)
+    }
+
+    fn dependency_exact_read(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        index: ContractIndex,
+        primary: u64,
+    ) {
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.exact_read(ContractRowKey::new(code, scope, table, index, primary));
+        }
+    }
+
+    fn dependency_table_read(&self, code: u64, scope: u64, table: u64) {
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.exact_read(ContractRowKey::table(code, scope, table));
+        }
+    }
+
+    fn dependency_range_read(&self, code: u64, scope: u64, table: u64, index: ContractIndex) {
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.range_read(ContractRangeKey::new(code, scope, table, index));
+        }
+    }
+
+    fn dependency_write(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        index: ContractIndex,
+        primary: u64,
+    ) {
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.write(ContractRowKey::new(code, scope, table, index, primary));
+        }
+    }
+
+    fn dependency_table_write(&self, code: u64, scope: u64, table: u64) {
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.write(ContractRowKey::table(code, scope, table));
+        }
     }
 
     /// Set the system-account identity used by runtime helpers. This is node
@@ -1092,6 +1159,7 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Option<Vec<u8>> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Primary, primary_key);
         self.backend.kv_get(code, scope, table, primary_key)
     }
 
@@ -1100,6 +1168,7 @@ impl Database {
     /// a contract sees walking db_lowerbound_i64 -> db_next_i64. Empty when the
     /// table is absent.
     pub fn arena_table_range(&self, code: u64, scope: u64, table: u64) -> Vec<(u64, Vec<u8>)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
         {
             Some(&self.backend)
                 .map(|s| s.table_range(code, scope, table))
@@ -1116,10 +1185,12 @@ impl Database {
     /// db_next successor), `prev` = last primary < key. `None` = off the end.
     /// All return `None`
     pub fn arena_kv_lower_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
         self.backend.kv_lower_bound(code, scope, table, key)
     }
 
     pub fn arena_kv_table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
+        self.dependency_table_read(code, scope, table);
         {
             Some(&self.backend)
                 .map(|s| s.kv_table_exists(code, scope, table))
@@ -1128,16 +1199,19 @@ impl Database {
     }
 
     pub fn arena_kv_upper_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
         self.backend.kv_upper_bound(code, scope, table, key)
     }
 
     pub fn arena_kv_prev(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
         self.backend.kv_prev(code, scope, table, key)
     }
 
     /// Largest primary in the table — db_previous_i64's landing when stepping
     /// back from the end iterator. `None` if empty.
     pub fn arena_kv_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
         self.backend.kv_last(code, scope, table)
     }
 
@@ -1153,6 +1227,7 @@ impl Database {
         table: u64,
         secondary: u64,
     ) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx64);
         self.backend
             .idx64_find_secondary(code, scope, table, secondary)
     }
@@ -1164,6 +1239,7 @@ impl Database {
         table: u64,
         secondary: u64,
     ) -> Option<(u64, u64)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx64);
         self.backend
             .idx64_lower_bound(code, scope, table, secondary)
     }
@@ -1175,6 +1251,7 @@ impl Database {
         table: u64,
         secondary: u64,
     ) -> Option<(u64, u64)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx64);
         self.backend
             .idx64_upper_bound(code, scope, table, secondary)
     }
@@ -1186,6 +1263,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx64, primary);
         self.backend.idx64_find_primary(code, scope, table, primary)
     }
 
@@ -1200,6 +1278,8 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<(u64, u64)> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx64, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx64);
         self.backend.idx64_next(code, scope, table, primary)
     }
 
@@ -1210,6 +1290,8 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<(u64, u64)> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx64, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx64);
         self.backend.idx64_previous(code, scope, table, primary)
     }
 
@@ -1223,6 +1305,7 @@ impl Database {
         payer: u64,
         secondary: u64,
     ) {
+        self.dependency_write(code, scope, table, ContractIndex::Idx64, primary);
         let s = &self.backend;
         if let Err(e) = s.update_index64_object(code, scope, table, primary, payer, secondary) {
             eprintln!("arena database of update_index64_object diverged: {e:?}");
@@ -1238,6 +1321,7 @@ impl Database {
         payer: u64,
         secondary: u128,
     ) {
+        self.dependency_write(code, scope, table, ContractIndex::Idx128, primary);
         let s = &self.backend;
         if let Err(e) = s.update_index128_object(code, scope, table, primary, payer, secondary) {
             eprintln!("arena database of update_index128_object diverged: {e:?}");
@@ -1253,6 +1337,7 @@ impl Database {
         payer: u64,
         secondary: &U256,
     ) {
+        self.dependency_write(code, scope, table, ContractIndex::Idx256, primary);
         let s = &self.backend;
         if let Err(e) =
             s.update_index256_object(code, scope, table, primary, payer, secondary.value)
@@ -1270,6 +1355,7 @@ impl Database {
         payer: u64,
         secondary: u64,
     ) {
+        self.dependency_write(code, scope, table, ContractIndex::IdxDouble, primary);
         let s = &self.backend;
         if let Err(e) = s.update_idx_double_object(code, scope, table, primary, payer, secondary) {
             eprintln!("arena database of update_idx_double_object diverged: {e:?}");
@@ -1285,6 +1371,7 @@ impl Database {
         payer: u64,
         secondary: &Float128,
     ) {
+        self.dependency_write(code, scope, table, ContractIndex::IdxLongDouble, primary);
         let s = &self.backend;
         if let Err(e) = s.update_idx_long_double_object(
             code,
@@ -1299,6 +1386,7 @@ impl Database {
     }
 
     pub fn arena_idx64_last(&self, code: u64, scope: u64, table: u64) -> Option<(u64, u64)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx64);
         self.backend.idx64_last(code, scope, table)
     }
 
@@ -1309,6 +1397,7 @@ impl Database {
         table: u64,
         secondary: u128,
     ) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx128);
         self.backend
             .idx128_find_secondary(code, scope, table, secondary)
     }
@@ -1320,6 +1409,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u128> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx128, primary);
         self.backend
             .idx128_find_primary(code, scope, table, primary)
     }
@@ -1331,6 +1421,7 @@ impl Database {
         table: u64,
         secondary: u128,
     ) -> Option<(u64, u128)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx128);
         self.backend
             .idx128_lower_bound(code, scope, table, secondary)
     }
@@ -1342,6 +1433,7 @@ impl Database {
         table: u64,
         secondary: u128,
     ) -> Option<(u64, u128)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx128);
         self.backend
             .idx128_upper_bound(code, scope, table, secondary)
     }
@@ -1355,6 +1447,7 @@ impl Database {
         table: u64,
         secondary_bits: u64,
     ) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxDouble);
         {
             self.backend.idx_double_find_secondary(
                 code,
@@ -1372,6 +1465,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxDouble, primary);
         {
             Some(&self.backend)
                 .and_then(|s| s.idx_double_find_primary(code, scope, table, primary))
@@ -1386,6 +1480,7 @@ impl Database {
         table: u64,
         secondary_bits: u64,
     ) -> Option<(u64, u64)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxDouble);
         {
             Some(&self.backend)
                 .and_then(|s| {
@@ -1402,6 +1497,7 @@ impl Database {
         table: u64,
         secondary_bits: u64,
     ) -> Option<(u64, u64)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxDouble);
         {
             Some(&self.backend)
                 .and_then(|s| {
@@ -1419,6 +1515,7 @@ impl Database {
         table: u64,
         secondary: [u8; 32],
     ) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx256);
         self.backend
             .idx256_find_secondary(code, scope, table, secondary)
     }
@@ -1430,6 +1527,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<[u8; 32]> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx256, primary);
         self.backend
             .idx256_find_primary(code, scope, table, primary)
     }
@@ -1441,6 +1539,7 @@ impl Database {
         table: u64,
         secondary: [u8; 32],
     ) -> Option<(u64, [u8; 32])> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx256);
         self.backend
             .idx256_lower_bound(code, scope, table, secondary)
     }
@@ -1452,6 +1551,7 @@ impl Database {
         table: u64,
         secondary: [u8; 32],
     ) -> Option<(u64, [u8; 32])> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx256);
         self.backend
             .idx256_upper_bound(code, scope, table, secondary)
     }
@@ -1464,6 +1564,7 @@ impl Database {
         table: u64,
         secondary: (u64, u64),
     ) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxLongDouble);
         {
             Some(&self.backend)
                 .and_then(|s| s.idx_long_double_find_secondary(code, scope, table, secondary))
@@ -1477,6 +1578,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<(u64, u64)> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxLongDouble, primary);
         {
             Some(&self.backend)
                 .and_then(|s| s.idx_long_double_find_primary(code, scope, table, primary))
@@ -1490,6 +1592,7 @@ impl Database {
         table: u64,
         secondary: (u64, u64),
     ) -> Option<(u64, (u64, u64))> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxLongDouble);
         {
             Some(&self.backend)
                 .and_then(|s| s.idx_long_double_lower_bound(code, scope, table, secondary))
@@ -1503,6 +1606,7 @@ impl Database {
         table: u64,
         secondary: (u64, u64),
     ) -> Option<(u64, (u64, u64))> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxLongDouble);
         {
             Some(&self.backend)
                 .and_then(|s| s.idx_long_double_upper_bound(code, scope, table, secondary))
@@ -1521,6 +1625,8 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx128, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx128);
         self.backend.idx128_next(code, scope, table, primary)
     }
 
@@ -1531,10 +1637,13 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx128, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx128);
         self.backend.idx128_previous(code, scope, table, primary)
     }
 
     pub fn arena_idx128_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx128);
         self.backend.idx128_last(code, scope, table)
     }
 
@@ -1545,6 +1654,8 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx256, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx256);
         self.backend.idx256_next(code, scope, table, primary)
     }
 
@@ -1555,10 +1666,13 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx256, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx256);
         self.backend.idx256_previous(code, scope, table, primary)
     }
 
     pub fn arena_idx256_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx256);
         self.backend.idx256_last(code, scope, table)
     }
 
@@ -1569,6 +1683,8 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxDouble, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxDouble);
         self.backend.idx_double_next(code, scope, table, primary)
     }
 
@@ -1579,11 +1695,14 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxDouble, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxDouble);
         self.backend
             .idx_double_previous(code, scope, table, primary)
     }
 
     pub fn arena_idx_double_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxDouble);
         self.backend.idx_double_last(code, scope, table)
     }
 
@@ -1594,6 +1713,8 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxLongDouble, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxLongDouble);
         self.backend
             .idx_long_double_next(code, scope, table, primary)
     }
@@ -1605,6 +1726,8 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxLongDouble, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxLongDouble);
         {
             Some(&self.backend)
                 .and_then(|s| s.idx_long_double_previous(code, scope, table, primary))
@@ -1612,6 +1735,7 @@ impl Database {
     }
 
     pub fn arena_idx_long_double_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxLongDouble);
         self.backend.idx_long_double_last(code, scope, table)
     }
 
@@ -3144,6 +3268,7 @@ impl Database {
     /// bills table-creation RAM only on the first row, so it decides existence
     /// against the arena rather than dereferencing a chainbase table pointer.
     pub fn arena_table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
+        self.dependency_table_read(code, scope, table);
         {
             Some(&self.backend)
                 .map(|s| s.table_exists(code, scope, table))
@@ -3154,6 +3279,7 @@ impl Database {
     /// The payer to credit the table_id_object overhead when a table's last child
     /// is removed, or `None` if the table is absent.
     pub fn arena_table_payer(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        self.dependency_table_read(code, scope, table);
         self.backend.table_payer(code, scope, table)
     }
 
@@ -3192,6 +3318,7 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Option<(u64, Vec<u8>)> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Primary, primary_key);
         self.backend.kv_row(code, scope, table, primary_key)
     }
 
@@ -3207,6 +3334,8 @@ impl Database {
         primary_key: u64,
         buffer: &[u8],
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
         let s = &self.backend;
         s.create_key_value_object(code, scope, table, payer, primary_key, buffer)
             .map_err(|e| ChainError::InternalError(format!("arena create_key_value_object: {e:?}")))
@@ -3222,6 +3351,7 @@ impl Database {
         payer: u64,
         buffer: &[u8],
     ) -> Result<(), ChainError> {
+        self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
         let s = &self.backend;
         s.update_key_value_object(code, scope, table, primary_key, payer, buffer)
             .map_err(|e| ChainError::InternalError(format!("arena update_key_value_object: {e:?}")))
@@ -3236,6 +3366,8 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
         let s = &self.backend;
         s.remove_key_value_object(code, scope, table, primary_key)
             .map_err(|e| ChainError::InternalError(format!("arena remove_key_value_object: {e:?}")))
@@ -3261,6 +3393,8 @@ impl Database {
         primary_key: u64,
         secondary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Idx64, primary_key);
         self.backend_ref()?
             .create_index64_object(code, scope, table, payer, primary_key, secondary_key)
             .map_err(|e| ChainError::InternalError(format!("arena create_index64: {e:?}")))
@@ -3275,6 +3409,7 @@ impl Database {
         payer: u64,
         secondary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_write(code, scope, table, ContractIndex::Idx64, primary_key);
         self.backend_ref()?
             .update_index64_object(code, scope, table, primary_key, payer, secondary_key)
             .map_err(|e| ChainError::InternalError(format!("arena update_index64: {e:?}")))
@@ -3287,6 +3422,8 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Idx64, primary_key);
         self.backend_ref()?
             .remove_index64_object(code, scope, table, primary_key)
             .map_err(|e| ChainError::InternalError(format!("arena remove_index64: {e:?}")))
@@ -3299,6 +3436,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx64, primary);
         Some(&self.backend).and_then(|s| s.idx64_payer(code, scope, table, primary))
     }
 
@@ -3311,6 +3449,8 @@ impl Database {
         primary_key: u64,
         secondary_key: u128,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Idx128, primary_key);
         self.backend_ref()?
             .create_index128_object(code, scope, table, payer, primary_key, secondary_key)
             .map_err(|e| ChainError::InternalError(format!("arena create_index128: {e:?}")))
@@ -3325,6 +3465,7 @@ impl Database {
         payer: u64,
         secondary_key: u128,
     ) -> Result<(), ChainError> {
+        self.dependency_write(code, scope, table, ContractIndex::Idx128, primary_key);
         self.backend_ref()?
             .update_index128_object(code, scope, table, primary_key, payer, secondary_key)
             .map_err(|e| ChainError::InternalError(format!("arena update_index128: {e:?}")))
@@ -3337,6 +3478,8 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Idx128, primary_key);
         self.backend_ref()?
             .remove_index128_object(code, scope, table, primary_key)
             .map_err(|e| ChainError::InternalError(format!("arena remove_index128: {e:?}")))
@@ -3349,6 +3492,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx128, primary);
         Some(&self.backend).and_then(|s| s.idx128_payer(code, scope, table, primary))
     }
 
@@ -3361,6 +3505,8 @@ impl Database {
         primary_key: u64,
         secondary_key: U256,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Idx256, primary_key);
         self.backend_ref()?
             .create_index256_object(code, scope, table, payer, primary_key, secondary_key.value)
             .map_err(|e| ChainError::InternalError(format!("arena create_index256: {e:?}")))
@@ -3375,6 +3521,7 @@ impl Database {
         payer: u64,
         secondary_key: U256,
     ) -> Result<(), ChainError> {
+        self.dependency_write(code, scope, table, ContractIndex::Idx256, primary_key);
         self.backend_ref()?
             .update_index256_object(code, scope, table, primary_key, payer, secondary_key.value)
             .map_err(|e| ChainError::InternalError(format!("arena update_index256: {e:?}")))
@@ -3387,6 +3534,8 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Idx256, primary_key);
         self.backend_ref()?
             .remove_index256_object(code, scope, table, primary_key)
             .map_err(|e| ChainError::InternalError(format!("arena remove_index256: {e:?}")))
@@ -3399,6 +3548,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx256, primary);
         Some(&self.backend).and_then(|s| s.idx256_payer(code, scope, table, primary))
     }
 
@@ -3411,6 +3561,8 @@ impl Database {
         primary_key: u64,
         secondary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::IdxDouble, primary_key);
         self.backend_ref()?
             .create_idx_double_object(code, scope, table, payer, primary_key, secondary_key)
             .map_err(|e| ChainError::InternalError(format!("arena create_idx_double: {e:?}")))
@@ -3425,6 +3577,7 @@ impl Database {
         payer: u64,
         secondary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_write(code, scope, table, ContractIndex::IdxDouble, primary_key);
         self.backend_ref()?
             .update_idx_double_object(code, scope, table, primary_key, payer, secondary_key)
             .map_err(|e| ChainError::InternalError(format!("arena update_idx_double: {e:?}")))
@@ -3437,6 +3590,8 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::IdxDouble, primary_key);
         self.backend_ref()?
             .remove_idx_double_object(code, scope, table, primary_key)
             .map_err(|e| ChainError::InternalError(format!("arena remove_idx_double: {e:?}")))
@@ -3449,6 +3604,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxDouble, primary);
         Some(&self.backend).and_then(|s| s.idx_double_payer(code, scope, table, primary))
     }
 
@@ -3461,6 +3617,14 @@ impl Database {
         primary_key: u64,
         secondary_key: Float128,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(
+            code,
+            scope,
+            table,
+            ContractIndex::IdxLongDouble,
+            primary_key,
+        );
         self.backend_ref()?
             .create_idx_long_double_object(
                 code,
@@ -3482,6 +3646,13 @@ impl Database {
         payer: u64,
         secondary_key: Float128,
     ) -> Result<(), ChainError> {
+        self.dependency_write(
+            code,
+            scope,
+            table,
+            ContractIndex::IdxLongDouble,
+            primary_key,
+        );
         self.backend_ref()?
             .update_idx_long_double_object(
                 code,
@@ -3501,6 +3672,14 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(
+            code,
+            scope,
+            table,
+            ContractIndex::IdxLongDouble,
+            primary_key,
+        );
         self.backend_ref()?
             .remove_idx_long_double_object(code, scope, table, primary_key)
             .map_err(|e| ChainError::InternalError(format!("arena remove_idx_long_double: {e:?}")))
@@ -3513,6 +3692,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxLongDouble, primary);
         Some(&self.backend).and_then(|s| s.idx_long_double_payer(code, scope, table, primary))
     }
 
@@ -4546,7 +4726,10 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{
+        collections::BTreeSet,
+        str::FromStr,
+    };
 
     use pulsevm_name::Name;
     use tempfile::TempDir;
@@ -5106,6 +5289,78 @@ mod tests {
         assert_eq!(db.get_block_cpu_limit().unwrap(), block_cpu);
         assert_eq!(db.get_block_net_limit().unwrap(), block_net);
     }
+
+    #[test]
+    fn contract_dependency_tracking_flows_through_database_clones() {
+        let db = Database::default();
+        let (tracked, tracker) = db.clone_with_dependency_tracking();
+        let inline_action_clone = tracked.clone();
+        let (code, scope, table, primary) = (1, 2, 3, 4);
+
+        assert!(!tracked.arena_table_exists(code, scope, table));
+        tracked
+            .create_key_value_object_standalone(code, scope, table, 5, primary, b"value")
+            .unwrap();
+        assert_eq!(
+            inline_action_clone.arena_kv_get(code, scope, table, primary),
+            Some(b"value".to_vec())
+        );
+        assert_eq!(
+            inline_action_clone.arena_kv_lower_bound(code, scope, table, 0),
+            Some(primary)
+        );
+
+        let report = tracker.snapshot();
+        assert_eq!(
+            report.exact_reads(),
+            &BTreeSet::from([
+                ContractRowKey::table(code, scope, table),
+                ContractRowKey::new(code, scope, table, ContractIndex::Primary, primary),
+            ])
+        );
+        assert_eq!(
+            report.range_reads(),
+            &BTreeSet::from([ContractRangeKey::new(
+                code,
+                scope,
+                table,
+                ContractIndex::Primary,
+            )])
+        );
+        assert_eq!(
+            report.writes(),
+            &BTreeSet::from([
+                ContractRowKey::table(code, scope, table),
+                ContractRowKey::new(code, scope, table, ContractIndex::Primary, primary),
+            ])
+        );
+        assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn dependency_tracking_does_not_change_arena_state() {
+        fn apply(db: &Database) {
+            db.create_key_value_object_standalone(10, 20, 30, 40, 50, b"same")
+                .unwrap();
+            db.create_index64_object_standalone(10, 20, 31, 40, 50, 60)
+                .unwrap();
+            db.update_index64_object_standalone(10, 20, 31, 50, 41, 61)
+                .unwrap();
+        }
+
+        let untracked = Database::default();
+        apply(&untracked);
+
+        let tracked_base = Database::default();
+        let (tracked, tracker) = tracked_base.clone_with_dependency_tracking();
+        apply(&tracked);
+
+        assert_eq!(untracked.arena_state_root(), tracked.arena_state_root());
+        let report = tracker.snapshot();
+        assert_eq!(report.exact_read_count(), 0);
+        assert_eq!(report.range_read_count(), 0);
+        assert_eq!(report.write_count(), 4);
+    }
 }
 
 impl Database {
@@ -5296,6 +5551,7 @@ impl Default for Database {
             native_system_contract: true,
             native_system_contract_locked: false,
             protocol_records: Arc::new(Mutex::new(Vec::new())),
+            dependency_recorder: None,
         }
     }
 }

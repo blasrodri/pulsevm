@@ -96,6 +96,29 @@ should favor conservative conflicts over unsafe parallel commits.
 4. **Producer mode:** enable only after validator parity over the full XPR replay
    and sustained multi-node tests.
 
+### Current dependency-telemetry slice
+
+The first rollout gate is available behind the node-local
+`PULSEVM_DEPENDENCY_TELEMETRY` environment variable. It is unset by default and
+does not change transaction execution or Arena state. When enabled, each
+explicit/deferred serial transaction receives an isolated recorder through its
+cloned `Database` handle; inline actions and WASM host functions inherit that
+same recorder. Debug logs include the transaction id, outcome, counts, exact
+contract row keys, conservative range keys, and writes.
+
+This initial slice covers the contract primary table plus idx64, idx128,
+idx256, idx_double, and idx_long_double. Point reads use stable logical row keys
+and iterator/secondary searches conservatively depend on the whole relevant
+index, including absent reads. Table existence and payer reads track the table
+metadata row. Child creation/removal also writes that metadata because it
+changes the table row count and can create or delete the table.
+
+Reports intentionally set `complete = false`: permissions, accounts, resource
+limits and usage, generated transactions, code/ABI, protocol features, producer
+schedules, and other system tables are not covered yet. No optimistic commit
+path may accept such a report. This makes the current code useful for measuring
+contract working-set size and candidate conflicts without overstating safety.
+
 Required gates include unit tests for exact keys and range phantoms, inline
 actions, authorization changes, contract upgrades, RAM exhaustion, deferred
 creation/cancellation, soft/hard failures, and traps; randomized serial-vs-

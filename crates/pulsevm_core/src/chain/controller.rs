@@ -105,6 +105,12 @@ const DISABLE_DEFERRED_TRXS_STAGE_2_FEATURE_DIGEST: [u8; 32] = [
     0x09, 0xe8, 0x6c, 0xb0, 0xac, 0xcf, 0x8d, 0x81, 0xc9, 0xe8, 0x5d, 0x34, 0xbe, 0xa4, 0xb9, 0x25,
     0xae, 0x93, 0x66, 0x26, 0xd0, 0x0c, 0x98, 0x4e, 0x46, 0x91, 0x18, 0x68, 0x91, 0xf5, 0xbc, 0x16,
 ];
+
+/// Observation-only rollout gate for transaction dependency telemetry. The
+/// value is read once so the default path has no environment lookup per
+/// transaction. Presence enables it; unset is the production default.
+static DEPENDENCY_TELEMETRY_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("PULSEVM_DEPENDENCY_TELEMETRY").is_some());
 use pulsevm_crypto::{
     Bytes,
     Digest,
@@ -2964,71 +2970,96 @@ impl Controller {
         skip_authorization: bool,
         is_deferred: bool,
     ) -> Result<TransactionResult, ChainError> {
-        let signed_transaction = packed_transaction.get_signed_transaction();
-
-        // Verify basic transaction validity
-        if !is_deferred {
-            signed_transaction
-                .transaction()
-                .validate(pending_block_timestamp)?;
-        }
-
-        // Verify authority — but only when this node is the one admitting the
-        // transaction (mempool/producing). When applying an already-accepted
-        // block (explicit_billed), signatures were authenticated by the producer,
-        // so this is Antelope light/replay validation: the authority check is
-        // skipped, exactly like the objective resource-limit checks below. It has
-        // no state effect (auth_sequence and permission-usage bumps happen during
-        // execution and finalize), so skipping it leaves the resulting state and
-        // receipts unchanged.
-        if explicit_billed.is_none() && !skip_authorization {
-            AuthorizationManager::check_authorization(
-                &mut self.db,
-                &signed_transaction.transaction().actions,
-                &signed_transaction.recovered_authority_keys(&self.chain_id)?,
-                &BTreeSet::new(),
-                seconds(signed_transaction.transaction().header.delay_sec.into()),
-                &BTreeSet::new(),
-            )?;
-        }
-
-        let mut trx_context = TransactionContext::new(
-            self.db.clone(),
-            self.wasm_runtime.clone(),
-            protocol_context,
-            pending_block_timestamp.clone(),
-            packed_transaction.id(),
-            *block_status,
-            packed_transaction.clone(),
-            self.max_transaction_time_ms(),
-        );
-        self.set_context_active_schedule(&trx_context)?;
-
-        // Applying an already-accepted block: bill the recorded cpu/net and
-        // skip the objective limit checks (Antelope light/replay validation).
-        if let Some((cpu_us, net_words)) = explicit_billed {
-            trx_context.set_explicit_billed(cpu_us, net_words)?;
-        }
-
-        let trx = packed_transaction.get_transaction();
-        if is_deferred {
-            trx_context.init_for_deferred_trx(
-                packed_transaction.get_unprunable_size()?,
-                packed_transaction.get_prunable_size()?,
-                &trx,
-                pending_block_timestamp.clone().into(),
-            )?;
+        let (mut execution_db, dependency_tracker) = if *DEPENDENCY_TELEMETRY_ENABLED {
+            let (database, tracker) = self.db.clone_with_dependency_tracking();
+            (database, Some(tracker))
         } else {
-            trx_context.init_for_input_trx(
-                packed_transaction.get_unprunable_size()?,
-                packed_transaction.get_prunable_size()?,
-                &trx,
-            )?;
-        }
-        trx_context.exec(&trx)?;
-        let result = trx_context.finalize()?;
+            (self.db.clone(), None)
+        };
 
-        Ok(result)
+        let execution = (|| {
+            let signed_transaction = packed_transaction.get_signed_transaction();
+
+            // Verify basic transaction validity
+            if !is_deferred {
+                signed_transaction
+                    .transaction()
+                    .validate(pending_block_timestamp)?;
+            }
+
+            // Verify authority — but only when this node is the one admitting the
+            // transaction (mempool/producing). When applying an already-accepted
+            // block (explicit_billed), signatures were authenticated by the producer,
+            // so this is Antelope light/replay validation: the authority check is
+            // skipped, exactly like the objective resource-limit checks below. It has
+            // no state effect (auth_sequence and permission-usage bumps happen during
+            // execution and finalize), so skipping it leaves the resulting state and
+            // receipts unchanged.
+            if explicit_billed.is_none() && !skip_authorization {
+                AuthorizationManager::check_authorization(
+                    &mut execution_db,
+                    &signed_transaction.transaction().actions,
+                    &signed_transaction.recovered_authority_keys(&self.chain_id)?,
+                    &BTreeSet::new(),
+                    seconds(signed_transaction.transaction().header.delay_sec.into()),
+                    &BTreeSet::new(),
+                )?;
+            }
+
+            let mut trx_context = TransactionContext::new(
+                execution_db,
+                self.wasm_runtime.clone(),
+                protocol_context,
+                pending_block_timestamp.clone(),
+                packed_transaction.id(),
+                *block_status,
+                packed_transaction.clone(),
+                self.max_transaction_time_ms(),
+            );
+            self.set_context_active_schedule(&trx_context)?;
+
+            // Applying an already-accepted block: bill the recorded cpu/net and
+            // skip the objective limit checks (Antelope light/replay validation).
+            if let Some((cpu_us, net_words)) = explicit_billed {
+                trx_context.set_explicit_billed(cpu_us, net_words)?;
+            }
+
+            let trx = packed_transaction.get_transaction();
+            if is_deferred {
+                trx_context.init_for_deferred_trx(
+                    packed_transaction.get_unprunable_size()?,
+                    packed_transaction.get_prunable_size()?,
+                    &trx,
+                    pending_block_timestamp.clone().into(),
+                )?;
+            } else {
+                trx_context.init_for_input_trx(
+                    packed_transaction.get_unprunable_size()?,
+                    packed_transaction.get_prunable_size()?,
+                    &trx,
+                )?;
+            }
+            trx_context.exec(&trx)?;
+            trx_context.finalize()
+        })();
+
+        if let Some(tracker) = dependency_tracker {
+            let report = tracker.snapshot();
+            debug!(
+                "dependency telemetry trx={} success={} complete={} exact_reads={} range_reads={} writes={} read_keys={:?} ranges={:?} write_keys={:?}",
+                packed_transaction.id(),
+                execution.is_ok(),
+                report.is_complete(),
+                report.exact_read_count(),
+                report.range_read_count(),
+                report.write_count(),
+                report.exact_reads(),
+                report.range_reads(),
+                report.writes(),
+            );
+        }
+
+        execution
     }
 
     pub fn last_accepted_block(&self) -> &SignedBlock {

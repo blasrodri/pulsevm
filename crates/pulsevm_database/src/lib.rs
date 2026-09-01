@@ -1,5 +1,6 @@
 mod backend;
 mod database;
+mod dependency;
 mod objects;
 mod pod;
 mod snapshot;
@@ -19,6 +20,13 @@ pub use crate::{
         PermissionInfo,
         SystemAccountNames,
         restore_snapshot,
+    },
+    dependency::{
+        ContractIndex,
+        ContractRangeKey,
+        ContractRowKey,
+        DependencyTracker,
+        TransactionDependencies,
     },
     objects::{
         Index64Object,
