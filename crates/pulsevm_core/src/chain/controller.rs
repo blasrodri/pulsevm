@@ -26,7 +26,10 @@ use crate::{
         SignedBlock,
     },
     chain::{
-        apply_context::ApplyContext,
+        apply_context::{
+            ApplyContext,
+            generated_transaction_billable_size,
+        },
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
         block::BlockHeader,
@@ -166,6 +169,26 @@ fn deferred_onerror_payload(sender_id: u128, packed_trx: &[u8]) -> Result<Vec<u8
     append_varuint32(&mut data, packed_trx.len())?;
     data.extend_from_slice(packed_trx);
     Ok(data)
+}
+
+fn retire_deferred_transaction(
+    db: &mut Database,
+    trx_id: [u8; 32],
+    payer: u64,
+    packed_trx_len: usize,
+) -> Result<(), ChainError> {
+    ResourceLimitsManager::add_pending_ram_usage(
+        db,
+        &Name::new(payer),
+        -generated_transaction_billable_size(packed_trx_len)?,
+    )?;
+    if !db.arena_remove_deferred_transaction(trx_id)? {
+        return Err(ChainError::InternalError(format!(
+            "cannot retire missing deferred transaction {}",
+            hex::encode(trx_id)
+        )));
+    }
+    Ok(())
 }
 
 pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
@@ -789,6 +812,66 @@ impl Controller {
         errors
     }
 
+    fn migration_source_block(
+        manifest: &MigrationManifest,
+    ) -> Result<Option<SignedBlock>, ChainError> {
+        let Some(packed_hex) = manifest.source_block.as_deref() else {
+            return Ok(None);
+        };
+        let packed = hex::decode(packed_hex).map_err(|error| {
+            ChainError::GenesisError(format!(
+                "migration manifest source_block is not hexadecimal: {error}"
+            ))
+        })?;
+        let mut position = 0;
+        let block = SignedBlock::read(&packed, &mut position).map_err(|error| {
+            ChainError::GenesisError(format!(
+                "migration manifest source_block cannot be decoded: {error}"
+            ))
+        })?;
+        if position != packed.len() {
+            return Err(ChainError::GenesisError(format!(
+                "migration manifest source_block has {} trailing bytes",
+                packed.len() - position
+            )));
+        }
+        let block_id = block.id()?;
+        if hex::encode(block_id.as_bytes()) != manifest.source_block_id {
+            return Err(ChainError::GenesisError(format!(
+                "migration source block id {block_id} does not match manifest {}",
+                manifest.source_block_id
+            )));
+        }
+        if i64::from(block.block_num()) != manifest.checkpoint_revision {
+            return Err(ChainError::GenesisError(format!(
+                "migration source block height {} does not match checkpoint revision {}",
+                block.block_num(),
+                manifest.checkpoint_revision
+            )));
+        }
+        if !block.block_extensions.is_empty() {
+            return Err(ChainError::GenesisError(
+                "migration source block contains unsupported block extensions".into(),
+            ));
+        }
+        let mut receipt_digests = VecDeque::with_capacity(block.transactions.len());
+        for receipt in &block.transactions {
+            receipt_digests.push_back(receipt.digest().map_err(|error| {
+                ChainError::GenesisError(format!(
+                    "migration source block transaction cannot be hashed: {error}"
+                ))
+            })?);
+        }
+        let transaction_mroot = merkle(&mut receipt_digests);
+        if transaction_mroot != block.signed_block_header.header.transaction_mroot {
+            return Err(ChainError::GenesisError(format!(
+                "migration source block transaction root {} does not match header {}",
+                transaction_mroot, block.signed_block_header.header.transaction_mroot
+            )));
+        }
+        Ok(Some(block))
+    }
+
     pub fn initialize(
         &mut self,
         chain_id: &Id,
@@ -850,6 +933,7 @@ impl Controller {
             .node_config
             .as_ref()
             .and_then(|config| config.migration_manifest.as_ref());
+        let mut migration_source_block = None;
         if let (Some(checkpoint), Some(manifest_path)) = (migration_checkpoint, migration_manifest)
         {
             let manifest_bytes = fs::read(manifest_path).map_err(|e| {
@@ -881,59 +965,79 @@ impl Controller {
                     hex::encode(expected_checkpoint_sha256)
                 )));
             }
-            let header = self
-                .db
-                .restore_from_path(std::path::Path::new(checkpoint))
-                .map_err(|e| {
-                    ChainError::GenesisError(format!(
-                        "failed to restore migration checkpoint {checkpoint}: {e}"
-                    ))
-                })?;
-            if header.revision <= 0 {
-                return Err(ChainError::GenesisError(
-                    "migration checkpoint must carry a positive revision".into(),
-                ));
-            }
-            for deferred in self.db.arena_deferred_transactions() {
-                let transaction = PackedTransaction::from_deferred_transaction_bytes(Bytes::from(
-                    deferred.packed_trx,
-                ))
-                .map_err(|error| {
-                    ChainError::GenesisError(format!(
-                        "migration deferred transaction {} cannot be decoded: {error}",
-                        hex::encode(deferred.trx_id)
-                    ))
-                })?;
-                if transaction.id().as_bytes() != deferred.trx_id {
-                    return Err(ChainError::GenesisError(format!(
-                        "migration deferred transaction {} does not match its packed bytes",
-                        hex::encode(deferred.trx_id)
-                    )));
+            migration_source_block = Self::migration_source_block(&manifest)?;
+            if self.db.revision() <= 0 {
+                let header = self
+                    .db
+                    .restore_from_path(std::path::Path::new(checkpoint))
+                    .map_err(|e| {
+                        ChainError::GenesisError(format!(
+                            "failed to restore migration checkpoint {checkpoint}: {e}"
+                        ))
+                    })?;
+                if header.revision <= 0 {
+                    return Err(ChainError::GenesisError(
+                        "migration checkpoint must carry a positive revision".into(),
+                    ));
                 }
-            }
-            // Leap's second deferred-transaction retirement feature removes all
-            // pending generated transactions when activated. A checkpoint made
-            // before that activation can still carry rows, so normalize them
-            // before the target chain starts producing blocks.
-            if self
-                .db
-                .protocol_feature_activated(DISABLE_DEFERRED_TRXS_STAGE_2_FEATURE_DIGEST)
-            {
-                let pending = self.db.arena_deferred_transactions();
-                for deferred in &pending {
-                    self.db.arena_remove_deferred_transaction(deferred.trx_id)?;
+                for deferred in self.db.arena_deferred_transactions() {
+                    let transaction = PackedTransaction::from_deferred_transaction_bytes(
+                        Bytes::from(deferred.packed_trx),
+                    )
+                    .map_err(|error| {
+                        ChainError::GenesisError(format!(
+                            "migration deferred transaction {} cannot be decoded: {error}",
+                            hex::encode(deferred.trx_id)
+                        ))
+                    })?;
+                    if transaction.id().as_bytes() != deferred.trx_id {
+                        return Err(ChainError::GenesisError(format!(
+                            "migration deferred transaction {} does not match its packed bytes",
+                            hex::encode(deferred.trx_id)
+                        )));
+                    }
                 }
-                if !pending.is_empty() {
-                    info!(
-                        "removed {} pending deferred transactions because DISABLE_DEFERRED_TRXS_STAGE_2 is active",
-                        pending.len()
-                    );
+                // Leap's second deferred-transaction retirement feature removes all
+                // pending generated transactions when activated. A checkpoint made
+                // before that activation can still carry rows, so normalize them
+                // before the target chain starts producing blocks.
+                if self
+                    .db
+                    .protocol_feature_activated(DISABLE_DEFERRED_TRXS_STAGE_2_FEATURE_DIGEST)
+                {
+                    let pending = self.db.arena_deferred_transactions();
+                    for deferred in &pending {
+                        retire_deferred_transaction(
+                            &mut self.db,
+                            deferred.trx_id,
+                            deferred.payer,
+                            deferred.packed_trx.len(),
+                        )?;
+                    }
+                    if !pending.is_empty() {
+                        info!(
+                            "removed {} pending deferred transactions because DISABLE_DEFERRED_TRXS_STAGE_2 is active",
+                            pending.len()
+                        );
+                    }
                 }
+                info!(
+                    "restored migration Arena checkpoint {} at revision {} from manifest {}",
+                    checkpoint, header.revision, manifest_path
+                );
+            } else if self.db.revision() < manifest.checkpoint_revision {
+                return Err(ChainError::GenesisError(format!(
+                    "existing database revision {} predates migration checkpoint {}",
+                    self.db.revision(),
+                    manifest.checkpoint_revision
+                )));
+            } else {
+                info!(
+                    "reusing migration Arena at revision {} without restoring checkpoint {}",
+                    self.db.revision(),
+                    checkpoint
+                );
             }
-            info!(
-                "restored migration Arena checkpoint {} at revision {} from manifest {}",
-                checkpoint, header.revision, manifest_path
-            );
         } else if migration_checkpoint.is_some() || migration_manifest.is_some() {
             return Err(ChainError::GenesisError(
                 "migration_checkpoint and migration_manifest must be configured together".into(),
@@ -965,7 +1069,7 @@ impl Controller {
         // Seed the active producer schedule from genesis: the sole producer is
         // the configured producer_name, and it signs blocks with the genesis
         // initial key. On restart this is the base the block log is replayed onto
-        // (see `reconstruct_schedule_from_log` below).
+        // during the single-pass accepted-log reconstruction below.
         let initial_key = PublicKey::new(rust_genesis.initial_key);
         self.active_schedule = ProducerSchedule {
             version: 0,
@@ -1025,6 +1129,11 @@ impl Controller {
         }
         self.last_accepted_block_id = self.last_accepted_block.id()?;
         self.preferred_id = self.last_accepted_block.id()?;
+        if let Some(source_block) = migration_source_block {
+            self.last_accepted_block = source_block;
+            self.last_accepted_block_id = self.last_accepted_block.id()?;
+            self.preferred_id = self.last_accepted_block_id;
+        }
         self.header_signing_state =
             HeaderSigningState::from_genesis(&self.last_accepted_block_id, &self.active_schedule)?;
 
@@ -1160,27 +1269,59 @@ impl Controller {
                     self.active_schedule = synced;
                 }
 
-                // Rebuild the active schedule from the committed chain rather than
-                // trusting an out-of-band file: the last block that carried a
-                // `new_producers` names the schedule in force, and if none did the
-                // base above still stands.
-                self.reconstruct_schedule_from_log(start, end)?;
-                if self
+                // Rebuild schedule and Antelope signing state in one sequential
+                // pass. `block_range` holds one buffered descriptor, avoiding two
+                // full scans and five filesystem syscalls per historical block.
+                let antelope_signatures = self
                     .node_config
                     .as_ref()
-                    .is_some_and(|config| config.antelope_block_signatures)
-                {
-                    // Rebuild the compact signing frontier alongside the
-                    // accepted block log. A genesis-based XPR replay retains the
-                    // complete log, so this reproduces nodeos header state.
-                    for height in start.max(genesis_height + 1)..=end {
-                        let block = self.get_block_by_height(height)?.ok_or_else(|| {
+                    .is_some_and(|config| config.antelope_block_signatures);
+                let mut schedule_state = ProducerScheduleState {
+                    active: self.active_schedule.clone(),
+                    pending: None,
+                };
+                let mut signing_state = self.header_signing_state.clone();
+                let schedule_scan_start = start.saturating_add(1);
+                let signing_scan_start = start.max(genesis_height + 1);
+                let scan_start = if antelope_signatures {
+                    schedule_scan_start.min(signing_scan_start)
+                } else {
+                    schedule_scan_start
+                };
+                if scan_start <= end {
+                    let blocks = self
+                        .block_log
+                        .as_ref()
+                        .expect("block log initialized")
+                        .block_range(scan_start, end)
+                        .map_err(|error| {
                             ChainError::DatabaseError(format!(
-                                "missing block {height} while rebuilding Antelope signing state"
+                                "failed to stream accepted block log: {error}"
                             ))
                         })?;
-                        self.header_signing_state.accept(&block)?;
+                    for packed in blocks {
+                        let (height, packed) = packed.map_err(|error| {
+                            ChainError::DatabaseError(format!(
+                                "failed to stream accepted block log: {error}"
+                            ))
+                        })?;
+                        let block = SignedBlock::read(&packed, &mut 0).map_err(|error| {
+                            ChainError::DatabaseError(format!(
+                                "failed to decode accepted block {height}: {error}"
+                            ))
+                        })?;
+                        if height >= schedule_scan_start {
+                            schedule_state.apply_header(&block.signed_block_header.header)?;
+                        }
+                        if antelope_signatures && height >= signing_scan_start {
+                            signing_state.accept(&block)?;
+                        }
                     }
+                }
+                self.active_schedule = schedule_state.active;
+                self.pending_schedule = schedule_state.pending;
+                if antelope_signatures {
+                    self.header_signing_state = signing_state;
                 }
             }
         }
@@ -1264,29 +1405,6 @@ impl Controller {
     ) -> Result<(), ChainError> {
         let block_height = context.block_height();
         self.validate_persisted_protocol_state(block_height.saturating_sub(1), false)
-    }
-
-    // Walk the block log back from the tip for the most recent block that changed
-    // the producer schedule; its header carries the schedule now in force. Runs
-    // once at startup. It is O(blocks since the last schedule change), which is
-    // the whole log when the schedule never changed — acceptable while chains are
-    // short; a cached height pointer is the obvious optimization if it gets hot.
-    fn reconstruct_schedule_from_log(&mut self, start: u32, end: u32) -> Result<(), ChainError> {
-        let mut state = ProducerScheduleState {
-            active: self.active_schedule.clone(),
-            pending: None,
-        };
-        for height in start.saturating_add(1)..=end {
-            let block = self.get_block_by_height(height)?.ok_or_else(|| {
-                ChainError::DatabaseError(format!(
-                    "missing block {height} while rebuilding producer schedule state"
-                ))
-            })?;
-            state.apply_header(&block.signed_block_header.header)?;
-        }
-        self.active_schedule = state.active;
-        self.pending_schedule = state.pending;
-        Ok(())
     }
 
     pub fn shutdown(&mut self) -> Result<(), ChainError> {
@@ -1432,8 +1550,8 @@ impl Controller {
 
         // Scheduled transactions are selected from durable Arena state, never
         // from the mempool. Their raw transaction bytes have no signatures: the
-        // source chain authorized them when they were scheduled. Keep each one
-        // in its own undo session so a failure leaves the queue untouched.
+        // source chain authorized them when they were scheduled. Nested undo
+        // sessions keep retirement separate from payload and `onerror` state.
         let now = timestamp.to_time_point().time_since_epoch().count();
         let disable_deferred_stage_1 =
             db.protocol_feature_activated(DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST);
@@ -1459,7 +1577,12 @@ impl Controller {
                 trace.block_time = timestamp.clone();
                 trace.scheduled = true;
                 trace.receipt = receipt.clone();
-                db.arena_remove_deferred_transaction(scheduled.trx_id)?;
+                retire_deferred_transaction(
+                    &mut self.db,
+                    scheduled.trx_id,
+                    scheduled.payer,
+                    scheduled.packed_trx.len(),
+                )?;
                 transaction_traces.push(trace);
                 transaction_receipts.push_back(TransactionReceipt::for_id(
                     receipt,
@@ -1483,6 +1606,21 @@ impl Controller {
                     hex::encode(scheduled.trx_id)
                 )));
             }
+            // Leap refunds and removes the generated-transaction object before
+            // executing its payload. Keep that retirement in an outer session
+            // while the payload runs in a child session: an objective payload
+            // failure rolls back its mutations without restoring the retired
+            // generated transaction before `onerror` runs.
+            db.arena_start_undo_session();
+            if let Err(error) = retire_deferred_transaction(
+                &mut self.db,
+                scheduled.trx_id,
+                scheduled.payer,
+                scheduled.packed_trx.len(),
+            ) {
+                db.arena_undo();
+                return Err(error);
+            }
             db.arena_start_undo_session();
             match self.execute_deferred_transaction_with_failure(
                 &transaction,
@@ -1491,7 +1629,7 @@ impl Controller {
                 scheduled.published,
             ) {
                 Ok(result) => {
-                    db.arena_remove_deferred_transaction(scheduled.trx_id)?;
+                    db.arena_squash();
                     db.arena_squash();
                     transaction_traces.push(result.trace.clone());
                     transaction_receipts.push_back(TransactionReceipt::for_id(
@@ -1509,7 +1647,7 @@ impl Controller {
                     db.arena_start_undo_session();
                     match self.execute_deferred_onerror(&scheduled, &timestamp, &block_status) {
                         Ok(result) => {
-                            db.arena_remove_deferred_transaction(scheduled.trx_id)?;
+                            db.arena_squash();
                             db.arena_squash();
                             transaction_traces.push(result.trace.clone());
                             transaction_receipts.push_back(TransactionReceipt::for_id(
@@ -1550,7 +1688,6 @@ impl Controller {
                             trace.block_time = timestamp.clone();
                             trace.scheduled = true;
                             trace.receipt = receipt.clone();
-                            db.arena_remove_deferred_transaction(scheduled.trx_id)?;
                             db.arena_squash();
                             transaction_traces.push(trace);
                             transaction_receipts.push_back(TransactionReceipt::for_id(
@@ -2484,6 +2621,16 @@ impl Controller {
                         receipt.transaction_id()
                     )));
                 }
+                // The generated object is retired before its payload executes,
+                // so the payer can reuse the refunded RAM within that payload.
+                // A rejected block unwinds both this refund and the removal in
+                // the block's surrounding Arena session.
+                retire_deferred_transaction(
+                    &mut self.db,
+                    transaction_id,
+                    deferred.payer,
+                    deferred.packed_trx.len(),
+                )?;
                 let result = match receipt.status() {
                     crate::chain::transaction::TransactionStatus::Expired => {
                         if (!disable_deferred_stage_1 && deferred.expiration >= now)
@@ -2600,7 +2747,6 @@ impl Controller {
                         )));
                     }
                 };
-                self.db.arena_remove_deferred_transaction(transaction_id)?;
                 let reproduced = TransactionReceipt::for_id(
                     result.trace.receipt.clone(),
                     *receipt.transaction_id(),
@@ -3894,6 +4040,7 @@ mod tests {
             authority::PermissionLevel,
             pulse_contract::{
                 NewAccount,
+                SetAbi,
                 SetCode,
             },
             transaction::{
@@ -4087,6 +4234,70 @@ mod tests {
         .sign(&private_key, &chain_id)?;
         let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
         Ok(packed_trx)
+    }
+
+    fn set_abi(
+        private_key: &PrivateKey,
+        account: Name,
+        abi: Vec<u8>,
+        chain_id: Id,
+    ) -> Result<PackedTransaction, ChainError> {
+        let trx = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            vec![Action::new(
+                PULSE_NAME,
+                SETABI_NAME,
+                SetAbi {
+                    account,
+                    abi: Arc::new(abi.into()),
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
+            )],
+        )
+        .sign(private_key, &chain_id)?;
+        Ok(PackedTransaction::from_signed_transaction(trx)?)
+    }
+
+    #[tokio::test]
+    async fn native_setabi_stores_opaque_xpr_payload() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let db = controller.database();
+        let before_metadata = db
+            .arena_account_metadata(PULSE_NAME.as_u64())
+            .expect("system account metadata exists");
+        let before_abi = db
+            .arena_account_abi_bytes(PULSE_NAME.as_u64())
+            .expect("system account ABI exists");
+        let before_ram = db.get_account_ram_usage(PULSE_NAME.as_u64())?;
+
+        // This is intentionally not a serialized AbiDefinition. XPR nodeos
+        // accepts setabi bytes opaquely and Mainnet contains such a payload.
+        let opaque_abi = vec![0xff, 0x00, 0x01];
+        let timestamp = *controller.last_accepted_block().timestamp();
+        controller.execute_transaction(
+            &set_abi(&private_key, PULSE_NAME, opaque_abi.clone(), chain_id)?,
+            &timestamp,
+            &BlockStatus::Building,
+        )?;
+
+        assert_eq!(
+            db.arena_account_abi_bytes(PULSE_NAME.as_u64()),
+            Some(opaque_abi.clone())
+        );
+        assert_eq!(
+            db.arena_account_metadata(PULSE_NAME.as_u64())
+                .expect("system account metadata still exists")
+                .abi_sequence,
+            before_metadata.abi_sequence + 1
+        );
+        assert_eq!(
+            db.get_account_ram_usage(PULSE_NAME.as_u64())?,
+            before_ram + opaque_abi.len() as i64 - before_abi.len() as i64
+        );
+        Ok(())
     }
 
     fn call_contract<T: Write>(
@@ -5448,6 +5659,7 @@ mod tests {
         let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
         let scheduled = create_account(&private_key, Name::from_str("deferred")?, chain_id)?;
         let trx_id: [u8; 32] = scheduled.id().as_bytes().try_into().unwrap();
+        let producer_ram_before = controller.db.get_account_ram_usage(PULSE_NAME.as_u64())?;
         controller.db.xpr_import_deferred_transaction(
             PULSE_NAME.as_u64(),
             7,
@@ -5457,6 +5669,11 @@ mod tests {
             i64::MAX,
             0,
             scheduled.packed_trx_bytes(),
+        )?;
+        ResourceLimitsManager::add_pending_ram_usage(
+            &mut controller.db,
+            &PULSE_NAME,
+            generated_transaction_billable_size(scheduled.packed_trx_bytes().len())?,
         )?;
 
         let mut mempool = Mempool::new();
@@ -5476,12 +5693,23 @@ mod tests {
             0,
             scheduled.packed_trx_bytes(),
         )?;
+        let validator_ram_before = validator.db.get_account_ram_usage(PULSE_NAME.as_u64())?;
+        ResourceLimitsManager::add_pending_ram_usage(
+            &mut validator.db,
+            &PULSE_NAME,
+            generated_transaction_billable_size(scheduled.packed_trx_bytes().len())?,
+        )?;
         let mut validator_mempool = Mempool::new();
         validator
             .verify_block(&block, &mut validator_mempool)
             .await?;
         validator.accept_block(&block.id()?, &mut validator_mempool)?;
         assert_eq!(validator.db.deferred_transaction_count(), 0);
+        assert_eq!(
+            validator.db.get_account_ram_usage(PULSE_NAME.as_u64())?,
+            validator_ram_before,
+            "validator must refund the generated transaction RAM bill"
+        );
         assert!(
             validator
                 .db
@@ -5490,10 +5718,115 @@ mod tests {
 
         controller.accept_block(&block.id()?, &mut mempool)?;
         assert_eq!(controller.db.deferred_transaction_count(), 0);
+        assert_eq!(
+            controller.db.get_account_ram_usage(PULSE_NAME.as_u64())?,
+            producer_ram_before,
+            "producer must refund the generated transaction RAM bill"
+        );
         assert!(
             controller
                 .db
                 .is_account(Name::from_str("deferred")?.as_u64())?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_payer_can_reuse_refunded_ram_during_execution() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let payer = Name::from_str("deferpayer")?;
+        let timestamp = controller.last_accepted_block().timestamp().clone();
+        controller.execute_transaction(
+            &create_account(&private_key, payer, chain_id)?,
+            &timestamp,
+            &BlockStatus::Building,
+        )?;
+
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "apply") (param i64 i64 i64)))
+            "#,
+        )
+        .map_err(|error| ChainError::InternalError(error.to_string()))?;
+        let code_ram = i64::try_from(wasm.len()).unwrap()
+            * i64::from(pulsevm_constants::SETCODE_RAM_BYTES_MULTIPLIER);
+        let scheduled = set_code(&private_key, payer, wasm, chain_id)?;
+        let trx_id: [u8; 32] = scheduled.id().as_bytes().try_into().unwrap();
+        let generated_ram =
+            generated_transaction_billable_size(scheduled.packed_trx_bytes().len())?;
+        let ram_before = controller.db.get_account_ram_usage(payer.as_u64())?;
+        controller.db.xpr_import_deferred_transaction(
+            PULSE_NAME.as_u64(),
+            11,
+            payer.as_u64(),
+            trx_id,
+            0,
+            i64::MAX,
+            0,
+            scheduled.packed_trx_bytes(),
+        )?;
+        ResourceLimitsManager::add_pending_ram_usage(&mut controller.db, &payer, generated_ram)?;
+        controller.db.set_account_limits(
+            payer.as_u64(),
+            ram_before + generated_ram.max(code_ram),
+            1_000_000,
+            1_000_000,
+        )?;
+
+        let mut mempool = Mempool::new();
+        let block = controller.build_block(&mut mempool).await?;
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(block.transactions[0].transaction_id(), scheduled.id());
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        assert_eq!(controller.db.deferred_transaction_count(), 0);
+        assert!(
+            controller.db.get_account_ram_usage(payer.as_u64())?
+                <= ram_before + generated_ram.max(code_ram),
+            "the payload must execute after its generated-transaction RAM is refunded"
+        );
+        assert_ne!(
+            controller.db.account_code_hash_vm(payer.as_u64())?.0,
+            [0; 32]
+        );
+
+        let (mut validator, validator_key, validator_chain_id, _validator_temp) =
+            init_test_controller()?;
+        let validator_timestamp = validator.last_accepted_block().timestamp().clone();
+        validator.execute_transaction(
+            &create_account(&validator_key, payer, validator_chain_id)?,
+            &validator_timestamp,
+            &BlockStatus::Building,
+        )?;
+        let validator_ram_before = validator.db.get_account_ram_usage(payer.as_u64())?;
+        validator.db.xpr_import_deferred_transaction(
+            PULSE_NAME.as_u64(),
+            11,
+            payer.as_u64(),
+            trx_id,
+            0,
+            i64::MAX,
+            0,
+            scheduled.packed_trx_bytes(),
+        )?;
+        ResourceLimitsManager::add_pending_ram_usage(&mut validator.db, &payer, generated_ram)?;
+        validator.db.set_account_limits(
+            payer.as_u64(),
+            validator_ram_before + generated_ram.max(code_ram),
+            1_000_000,
+            1_000_000,
+        )?;
+        let mut validator_mempool = Mempool::new();
+        validator
+            .verify_block(&block, &mut validator_mempool)
+            .await?;
+        validator.accept_block(&block.id()?, &mut validator_mempool)?;
+        assert_eq!(validator.db.deferred_transaction_count(), 0);
+        assert_ne!(
+            validator.db.account_code_hash_vm(payer.as_u64())?.0,
+            [0; 32]
         );
         Ok(())
     }
@@ -6685,6 +7018,7 @@ mod tests {
                 &block_status,
             )
             .map_err(|error| ChainError::InternalError(format!("set cancel code: {error}")))?;
+        let ram_before_cancel = controller.db.get_account_ram_usage(payer)?;
         controller
             .execute_transaction(
                 &call_contract(
@@ -6704,6 +7038,11 @@ mod tests {
                 .arena_deferred_transaction_by_sender_id(account.as_u64(), sender_id)
                 .is_none(),
             "cancel_deferred must remove the generated transaction row"
+        );
+        assert_eq!(
+            controller.db.get_account_ram_usage(payer)?,
+            ram_before_cancel - generated_transaction_billable_size(deferred.len())?,
+            "cancel_deferred must refund the generated transaction RAM bill"
         );
 
         Ok(())
@@ -7840,7 +8179,7 @@ mod tests {
         let migrated = Name::from_str("migrated")?;
         checkpoint_db.create_account(PULSE_NAME.as_u64(), 7)?;
         checkpoint_db.create_account(migrated.as_u64(), 42)?;
-        checkpoint_db.set_revision(1)?;
+        checkpoint_db.set_revision(42)?;
         let checkpoint = checkpoint_db.snapshot_bytes()?;
         fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
             ChainError::InternalError(format!(
@@ -7849,13 +8188,25 @@ mod tests {
             ))
         })?;
         let manifest_path = temp.path().join("migration.manifest.json");
-        let manifest = MigrationManifest::new(
+        let mut previous = [0u8; 32];
+        previous[..4].copy_from_slice(&41u32.to_be_bytes());
+        let source_block = SignedBlock::new(
+            Id::new(previous),
+            BlockTimestamp::new(1_700_000_000),
+            PULSE_NAME,
+            VecDeque::new(),
+            Digest::default(),
+            Digest::default(),
+        );
+        let source_block_id = source_block.id()?;
+        let mut manifest = MigrationManifest::new(
             b"controller migration test source",
-            [7; 32],
+            source_block_id.0.0,
             &checkpoint,
-            1,
+            42,
             Default::default(),
         );
+        manifest.source_block = Some(hex::encode(source_block.pack()?));
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).map_err(|e| {
             ChainError::InternalError(format!(
                 "failed to write migration manifest {}: {e}",
@@ -7884,7 +8235,9 @@ mod tests {
             target_path.to_str().unwrap(),
         )?;
 
-        assert_eq!(controller.database().revision(), 1);
+        assert_eq!(controller.database().revision(), 42);
+        assert_eq!(controller.last_accepted_block().block_num(), 42);
+        assert_eq!(controller.last_accepted_block().id()?, source_block_id);
         assert!(
             controller
                 .database()
@@ -7896,6 +8249,18 @@ mod tests {
                 .arena_account_exists(PULSE_NAME.as_u64())
         );
         controller.shutdown()?;
+        drop(controller);
+
+        let mut restarted = Controller::new();
+        restarted.initialize(
+            &chain_id,
+            &config_bytes,
+            &migration_genesis,
+            target_path.to_str().unwrap(),
+        )?;
+        assert_eq!(restarted.database().revision(), 42);
+        assert_eq!(restarted.last_accepted_block().id()?, source_block_id);
+        restarted.shutdown()?;
         Ok(())
     }
 
