@@ -86,30 +86,91 @@ impl ContractRangeKey {
     }
 }
 
+/// Stable logical identity of consensus-visible non-contract state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SystemKey {
+    Account(u64),
+    AccountMetadata(u64),
+    Permission {
+        owner: u64,
+        name: u64,
+    },
+    PermissionUsage {
+        owner: u64,
+        name: u64,
+    },
+    PermissionLink {
+        account: u64,
+        code: u64,
+        message_type: u64,
+    },
+    /// Code rows are conservatively coarsened by hash because unlink resolves
+    /// its refcount target by hash before VM metadata.
+    Code([u8; 32]),
+    PermissionSequence,
+    GlobalActionSequence,
+    ChainConfig,
+    ProposedSchedule,
+    ProtocolFeature([u8; 32]),
+    PreactivatedProtocolFeatures,
+    ResourceUsage(u64),
+    /// Effective limits coarsen the pending and committed rows into one key.
+    ResourceLimits(u64),
+    ResourceState,
+    ResourceConfig,
+    Transaction([u8; 32]),
+    DeferredTransaction([u8; 32]),
+    DeferredSender {
+        sender: u64,
+        sender_id: u128,
+    },
+}
+
+/// Conservative non-contract scan dependency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SystemRangeKey {
+    PermissionsByOwner(u64),
+    DeferredDueQueue,
+}
+
+/// One exact consensus-state dependency across contract and system tables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DependencyKey {
+    Contract(ContractRowKey),
+    System(SystemKey),
+}
+
+/// One conservative range/phantom dependency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RangeDependency {
+    Contract(ContractRangeKey),
+    System(SystemRangeKey),
+}
+
 /// Dependencies observed while executing one serial transaction.
 ///
-/// `complete` is deliberately false in this first slice: contract-table
-/// intrinsics are covered, while permissions, resource limits, deferred
-/// transactions, protocol state, and other system tables are not yet versioned.
-/// An optimistic commit implementation must reject incomplete reports.
+/// `complete` remains deliberately false: known contract and system-state paths
+/// are recorded, but a versioned private overlay and independent call-path audit
+/// do not exist yet. An optimistic commit implementation must reject incomplete
+/// reports.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TransactionDependencies {
-    exact_reads: BTreeSet<ContractRowKey>,
-    range_reads: BTreeSet<ContractRangeKey>,
-    writes: BTreeSet<ContractRowKey>,
+    exact_reads: BTreeSet<DependencyKey>,
+    range_reads: BTreeSet<RangeDependency>,
+    writes: BTreeSet<DependencyKey>,
     complete: bool,
 }
 
 impl TransactionDependencies {
-    pub fn exact_reads(&self) -> &BTreeSet<ContractRowKey> {
+    pub fn exact_reads(&self) -> &BTreeSet<DependencyKey> {
         &self.exact_reads
     }
 
-    pub fn range_reads(&self) -> &BTreeSet<ContractRangeKey> {
+    pub fn range_reads(&self) -> &BTreeSet<RangeDependency> {
         &self.range_reads
     }
 
-    pub fn writes(&self) -> &BTreeSet<ContractRowKey> {
+    pub fn writes(&self) -> &BTreeSet<DependencyKey> {
         &self.writes
     }
 
@@ -135,16 +196,30 @@ impl TransactionDependencies {
     /// transaction changed the same logical row. A range read conflicts with
     /// any earlier write to that index, providing conservative phantom safety.
     /// Incomplete reports must still be rejected by the caller independently.
-    pub fn conflicts_with_prior_writes(&self, prior_writes: &BTreeSet<ContractRowKey>) -> bool {
+    pub fn conflicts_with_prior_writes(&self, prior_writes: &BTreeSet<DependencyKey>) -> bool {
         prior_writes.iter().any(|write| {
             self.exact_reads.contains(write)
                 || self.writes.contains(write)
-                || self.range_reads.contains(&ContractRangeKey::new(
-                    write.code,
-                    write.scope,
-                    write.table,
-                    write.index,
-                ))
+                || match write {
+                    DependencyKey::Contract(write) => self.range_reads.contains(
+                        &RangeDependency::Contract(ContractRangeKey::new(
+                            write.code,
+                            write.scope,
+                            write.table,
+                            write.index,
+                        )),
+                    ),
+                    DependencyKey::System(SystemKey::Permission { owner, .. }) => {
+                        self.range_reads.contains(&RangeDependency::System(
+                            SystemRangeKey::PermissionsByOwner(*owner),
+                        ))
+                    }
+                    DependencyKey::System(SystemKey::DeferredTransaction(_))
+                    | DependencyKey::System(SystemKey::DeferredSender { .. }) => self
+                        .range_reads
+                        .contains(&RangeDependency::System(SystemRangeKey::DeferredDueQueue)),
+                    DependencyKey::System(_) => false,
+                }
         })
     }
 
@@ -152,7 +227,7 @@ impl TransactionDependencies {
     ///
     /// Keeping the completeness check next to conflict validation prevents a
     /// partially instrumented report from being accidentally treated as valid.
-    pub fn can_optimistically_commit_after(&self, prior_writes: &BTreeSet<ContractRowKey>) -> bool {
+    pub fn can_optimistically_commit_after(&self, prior_writes: &BTreeSet<DependencyKey>) -> bool {
         self.complete && !self.conflicts_with_prior_writes(prior_writes)
     }
 }
@@ -163,7 +238,7 @@ pub(crate) struct DependencyRecorder {
 }
 
 impl DependencyRecorder {
-    pub(crate) fn exact_read(&self, key: ContractRowKey) {
+    pub(crate) fn exact_read(&self, key: DependencyKey) {
         // Telemetry must never affect consensus execution. A poisoned recorder
         // is therefore ignored rather than surfaced through a database API.
         if let Ok(mut report) = self.inner.lock() {
@@ -171,13 +246,13 @@ impl DependencyRecorder {
         }
     }
 
-    pub(crate) fn range_read(&self, key: ContractRangeKey) {
+    pub(crate) fn range_read(&self, key: RangeDependency) {
         if let Ok(mut report) = self.inner.lock() {
             report.range_reads.insert(key);
         }
     }
 
-    pub(crate) fn write(&self, key: ContractRowKey) {
+    pub(crate) fn write(&self, key: DependencyKey) {
         if let Ok(mut report) = self.inner.lock() {
             report.writes.insert(key);
         }
@@ -221,8 +296,9 @@ mod tests {
     #[test]
     fn recorder_deduplicates_stable_dependencies() {
         let tracker = DependencyTracker::new();
-        let row = ContractRowKey::new(1, 2, 3, ContractIndex::Primary, 4);
-        let range = ContractRangeKey::new(1, 2, 3, ContractIndex::Primary);
+        let row = DependencyKey::Contract(ContractRowKey::new(1, 2, 3, ContractIndex::Primary, 4));
+        let range =
+            RangeDependency::Contract(ContractRangeKey::new(1, 2, 3, ContractIndex::Primary));
 
         tracker.recorder.exact_read(row);
         tracker.recorder.exact_read(row);
@@ -243,7 +319,7 @@ mod tests {
         let first = DependencyTracker::new();
         let first_clone = first.clone();
         let second = DependencyTracker::new();
-        let row = ContractRowKey::table(7, 8, 9);
+        let row = DependencyKey::Contract(ContractRowKey::table(7, 8, 9));
 
         first_clone.recorder.write(row);
 
@@ -254,9 +330,22 @@ mod tests {
     #[test]
     fn conflict_check_covers_exact_write_and_range_phantoms() {
         let table = (11, 12, 13);
-        let row_7 = ContractRowKey::new(table.0, table.1, table.2, ContractIndex::Idx64, 7);
-        let row_8 = ContractRowKey::new(table.0, table.1, table.2, ContractIndex::Idx64, 8);
-        let unrelated = ContractRowKey::new(99, 12, 13, ContractIndex::Idx64, 8);
+        let row_7 = DependencyKey::Contract(ContractRowKey::new(
+            table.0,
+            table.1,
+            table.2,
+            ContractIndex::Idx64,
+            7,
+        ));
+        let row_8 = DependencyKey::Contract(ContractRowKey::new(
+            table.0,
+            table.1,
+            table.2,
+            ContractIndex::Idx64,
+            8,
+        ));
+        let unrelated =
+            DependencyKey::Contract(ContractRowKey::new(99, 12, 13, ContractIndex::Idx64, 8));
 
         let exact = TransactionDependencies {
             exact_reads: BTreeSet::from([row_7]),
@@ -280,15 +369,41 @@ mod tests {
         assert!(write.conflicts_with_prior_writes(&BTreeSet::from([row_7])));
 
         let range = TransactionDependencies {
-            range_reads: BTreeSet::from([ContractRangeKey::new(
+            range_reads: BTreeSet::from([RangeDependency::Contract(ContractRangeKey::new(
                 table.0,
                 table.1,
                 table.2,
                 ContractIndex::Idx64,
-            )]),
+            ))]),
             ..Default::default()
         };
         assert!(range.conflicts_with_prior_writes(&BTreeSet::from([row_8])));
         assert!(!range.conflicts_with_prior_writes(&BTreeSet::from([unrelated])));
+
+        let permission_range = TransactionDependencies {
+            range_reads: BTreeSet::from([RangeDependency::System(
+                SystemRangeKey::PermissionsByOwner(42),
+            )]),
+            ..Default::default()
+        };
+        let permission_write = DependencyKey::System(SystemKey::Permission { owner: 42, name: 7 });
+        assert!(permission_range.conflicts_with_prior_writes(&BTreeSet::from([permission_write,])));
+
+        let due_queue = TransactionDependencies {
+            range_reads: BTreeSet::from([RangeDependency::System(
+                SystemRangeKey::DeferredDueQueue,
+            )]),
+            ..Default::default()
+        };
+        let deferred_write = DependencyKey::System(SystemKey::DeferredSender {
+            sender: 17,
+            sender_id: 18,
+        });
+        assert!(due_queue.conflicts_with_prior_writes(&BTreeSet::from([deferred_write])));
+        assert!(
+            !due_queue.conflicts_with_prior_writes(&BTreeSet::from([DependencyKey::System(
+                SystemKey::Account(17)
+            ),]))
+        );
     }
 }

@@ -104,20 +104,32 @@ does not change transaction execution or Arena state. When enabled, each
 explicit/deferred serial transaction receives an isolated recorder through its
 cloned `Database` handle; inline actions and WASM host functions inherit that
 same recorder. Debug logs include the transaction id, outcome, counts, exact
-contract row keys, conservative range keys, and writes.
+contract/system keys, conservative range keys, and writes.
 
-This initial slice covers the contract primary table plus idx64, idx128,
+The recorder covers the contract primary table plus idx64, idx128,
 idx256, idx_double, and idx_long_double. Point reads use stable logical row keys
 and iterator/secondary searches conservatively depend on the whole relevant
 index, including absent reads. Table existence and payer reads track the table
 metadata row. Child creation/removal also writes that metadata because it
 changes the table row count and can create or delete the table.
 
-Reports intentionally set `complete = false`: permissions, accounts, resource
-limits and usage, generated transactions, code/ABI, protocol features, producer
-schedules, and other system tables are not covered yet. No optimistic commit
-path may accept such a report. This makes the current code useful for measuring
-contract working-set size and candidate conflicts without overstating safety.
+Consensus-visible system state reached by explicit/deferred transaction
+execution is also recorded: accounts and metadata, code objects, permissions,
+permission usage and links, chain configuration, proposed producer schedules,
+protocol features and their preactivation queue, resource limits/usage/config,
+input-transaction dedupe rows, deferred transactions, and receipt sequence
+counters. Permission-tree walks and due-deferred scans use conservative range
+keys. Exact logical keys deliberately coarsen pending/committed resource limits
+and singleton state where field-level merging has not been proven safe.
+
+Reports still intentionally set `complete = false`, so no optimistic commit
+path may accept them. The remaining safety boundary is not another known Arena
+table: it is the missing versioned snapshot/private overlay, ordered changeset
+application, and an independent call-path audit proving that future execution
+cannot bypass the recorder. Global action receipt sequencing and per-block
+resource usage are conservative singleton writes, so they currently conflict
+across transactions; safe ordered rebasing or aggregation is required before
+telemetry can translate into useful parallel commits.
 
 Required gates include unit tests for exact keys and range phantoms, inline
 actions, authorization changes, contract upgrades, RAM exhaustion, deferred

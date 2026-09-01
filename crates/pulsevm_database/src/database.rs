@@ -40,8 +40,12 @@ use crate::{
         ContractIndex,
         ContractRangeKey,
         ContractRowKey,
+        DependencyKey,
         DependencyRecorder,
         DependencyTracker,
+        RangeDependency,
+        SystemKey,
+        SystemRangeKey,
     },
 };
 
@@ -731,19 +735,25 @@ impl Database {
         primary: u64,
     ) {
         if let Some(recorder) = &self.dependency_recorder {
-            recorder.exact_read(ContractRowKey::new(code, scope, table, index, primary));
+            recorder.exact_read(DependencyKey::Contract(ContractRowKey::new(
+                code, scope, table, index, primary,
+            )));
         }
     }
 
     fn dependency_table_read(&self, code: u64, scope: u64, table: u64) {
         if let Some(recorder) = &self.dependency_recorder {
-            recorder.exact_read(ContractRowKey::table(code, scope, table));
+            recorder.exact_read(DependencyKey::Contract(ContractRowKey::table(
+                code, scope, table,
+            )));
         }
     }
 
     fn dependency_range_read(&self, code: u64, scope: u64, table: u64, index: ContractIndex) {
         if let Some(recorder) = &self.dependency_recorder {
-            recorder.range_read(ContractRangeKey::new(code, scope, table, index));
+            recorder.range_read(RangeDependency::Contract(ContractRangeKey::new(
+                code, scope, table, index,
+            )));
         }
     }
 
@@ -756,13 +766,35 @@ impl Database {
         primary: u64,
     ) {
         if let Some(recorder) = &self.dependency_recorder {
-            recorder.write(ContractRowKey::new(code, scope, table, index, primary));
+            recorder.write(DependencyKey::Contract(ContractRowKey::new(
+                code, scope, table, index, primary,
+            )));
         }
     }
 
     fn dependency_table_write(&self, code: u64, scope: u64, table: u64) {
         if let Some(recorder) = &self.dependency_recorder {
-            recorder.write(ContractRowKey::table(code, scope, table));
+            recorder.write(DependencyKey::Contract(ContractRowKey::table(
+                code, scope, table,
+            )));
+        }
+    }
+
+    fn dependency_system_read(&self, key: SystemKey) {
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.exact_read(DependencyKey::System(key));
+        }
+    }
+
+    fn dependency_system_range_read(&self, key: SystemRangeKey) {
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.range_read(RangeDependency::System(key));
+        }
+    }
+
+    fn dependency_system_write(&self, key: SystemKey) {
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.write(DependencyKey::System(key));
         }
     }
 
@@ -1071,6 +1103,7 @@ impl Database {
     /// `get_account_creation_time` intrinsic returns. Errors when the account is
     /// absent, matching the old chainbase `get_account` lookup.
     pub fn account_creation_time_micros(&self, account_name: u64) -> Result<i64, ChainError> {
+        self.dependency_system_read(SystemKey::Account(account_name));
         self.backend
             .account_creation_date(account_name)
             .map(block_slot_to_micros)
@@ -2456,6 +2489,7 @@ impl Database {
         account_name: u64,
         creation_date: u32,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::Account(account_name));
         self.backend
             .create_account(account_name, creation_date)
             .map_err(|e| {
@@ -2468,12 +2502,14 @@ impl Database {
         account_name: u64,
         is_privileged: bool,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::AccountMetadata(account_name));
         self.backend
             .create_account_metadata(account_name, is_privileged)
             .map_err(|e| ChainError::InternalError(format!("arena create_account_metadata: {e:?}")))
     }
 
     pub fn set_privileged(&mut self, account: u64, is_privileged: bool) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::AccountMetadata(account));
         let s = &self.backend;
         return s.set_privileged(account, is_privileged).map_err(|e| {
             ChainError::InternalError(format!("arena set_privileged {account}: {e:?}"))
@@ -2490,6 +2526,7 @@ impl Database {
         _vm_type: u8,
         _vm_version: u8,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::Code(*code_hash));
         self.backend
             .unlink_account_code(*code_hash)
             .map_err(|e| ChainError::InternalError(format!("arena unlink_account_code: {e:?}")))
@@ -2509,6 +2546,10 @@ impl Database {
         vm_type: u8,
         vm_version: u8,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::AccountMetadata(account_name));
+        if !new_code.is_empty() {
+            self.dependency_system_write(SystemKey::Code(*code_hash));
+        }
         self.backend
             .update_account_code(
                 account_name,
@@ -2525,6 +2566,8 @@ impl Database {
     /// Replace an account's ABI. Takes the account *name*; both the account and
     /// account_metadata objects are resolved inside the write scope.
     pub fn update_account_abi(&mut self, account_name: u64, abi: &[u8]) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::Account(account_name));
+        self.dependency_system_write(SystemKey::AccountMetadata(account_name));
         let s = &self.backend;
         return s
             .update_account_abi(account_name, abi)
@@ -2687,6 +2730,8 @@ impl Database {
         published: i64,
         packed_trx: &[u8],
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::DeferredTransaction(trx_id));
+        self.dependency_system_write(SystemKey::DeferredSender { sender, sender_id });
         self.backend
             .xpr_import_deferred_transaction(
                 sender,
@@ -2713,6 +2758,7 @@ impl Database {
         &self,
         trx_id: [u8; 32],
     ) -> Option<crate::backend::DeferredTransaction> {
+        self.dependency_system_read(SystemKey::DeferredTransaction(trx_id));
         self.backend.deferred_transaction(trx_id)
     }
 
@@ -2721,6 +2767,7 @@ impl Database {
         sender: u64,
         sender_id: u128,
     ) -> Option<crate::backend::DeferredTransaction> {
+        self.dependency_system_read(SystemKey::DeferredSender { sender, sender_id });
         self.backend
             .deferred_transaction_by_sender_id(sender, sender_id)
     }
@@ -2729,14 +2776,23 @@ impl Database {
         &self,
         now_micros: i64,
     ) -> Vec<crate::backend::DeferredTransaction> {
+        self.dependency_system_range_read(SystemRangeKey::DeferredDueQueue);
         self.backend.due_deferred_transactions(now_micros)
     }
 
     pub fn arena_deferred_transactions(&self) -> Vec<crate::backend::DeferredTransaction> {
+        self.dependency_system_range_read(SystemRangeKey::DeferredDueQueue);
         self.backend.deferred_transactions()
     }
 
     pub fn arena_remove_deferred_transaction(&self, trx_id: [u8; 32]) -> Result<bool, ChainError> {
+        self.dependency_system_write(SystemKey::DeferredTransaction(trx_id));
+        if let Some(row) = self.backend.deferred_transaction(trx_id) {
+            self.dependency_system_write(SystemKey::DeferredSender {
+                sender: row.sender,
+                sender_id: row.sender_id,
+            });
+        }
         self.backend
             .remove_deferred_transaction(trx_id)
             .map_err(|e| {
@@ -2749,13 +2805,19 @@ impl Database {
         sender: u64,
         sender_id: u128,
     ) -> Result<Option<crate::backend::DeferredTransaction>, ChainError> {
-        self.backend
+        self.dependency_system_write(SystemKey::DeferredSender { sender, sender_id });
+        let removed = self
+            .backend
             .remove_deferred_transaction_by_sender_id(sender, sender_id)
             .map_err(|e| {
                 ChainError::InternalError(format!(
                     "arena remove deferred transaction by sender id: {e:?}"
                 ))
-            })
+            })?;
+        if let Some(row) = &removed {
+            self.dependency_system_write(SystemKey::DeferredTransaction(row.trx_id));
+        }
+        Ok(removed)
     }
 
     pub(crate) fn xpr_import_permission(
@@ -2932,6 +2994,8 @@ impl Database {
         &mut self,
         account_name: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::ResourceUsage(account_name));
+        self.dependency_system_write(SystemKey::ResourceLimits(account_name));
         let s = &self.backend;
         return s
             .initialize_account_resource_limits(account_name)
@@ -2974,6 +3038,11 @@ impl Database {
         validate: bool,
     ) -> Result<(), ChainError> {
         const MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER: u32 = 1000;
+
+        self.dependency_system_read(SystemKey::ResourceConfig);
+        self.dependency_system_read(SystemKey::ResourceLimits(account));
+        self.dependency_system_write(SystemKey::ResourceUsage(account));
+        self.dependency_system_write(SystemKey::ResourceState);
 
         let (net_window, cpu_window) =
             self.get_account_net_usage_average_window().and_then(|nw| {
@@ -3040,6 +3109,7 @@ impl Database {
         account_name: u64,
         ram_bytes: i64,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::ResourceUsage(account_name));
         let s = &self.backend;
         return s
             .add_pending_ram_usage(account_name, ram_bytes)
@@ -3047,6 +3117,8 @@ impl Database {
     }
 
     pub fn verify_account_ram_usage(&mut self, account_name: u64) -> Result<(), ChainError> {
+        self.dependency_system_read(SystemKey::ResourceLimits(account_name));
+        self.dependency_system_read(SystemKey::ResourceUsage(account_name));
         // Reproduce chainbase's resource_limits check: an account whose RAM quota
         // is set (>= 0) may not use more than it. A negative quota is unlimited.
         let ram_bytes = self
@@ -3087,6 +3159,7 @@ impl Database {
     }
 
     pub fn get_account_ram_usage(&self, account_name: u64) -> Result<i64, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceUsage(account_name));
         self.backend
             .account_ram_usage(account_name)
             .map(|u| u as i64)
@@ -3096,6 +3169,7 @@ impl Database {
     }
 
     pub fn get_account_net_usage_average_window(&self) -> Result<u32, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceConfig);
         let s = &self.backend;
         return s
             .usage_average_windows()
@@ -3104,6 +3178,7 @@ impl Database {
     }
 
     pub fn get_account_cpu_usage_average_window(&self) -> Result<u32, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceConfig);
         let s = &self.backend;
         return s
             .usage_average_windows()
@@ -3122,6 +3197,7 @@ impl Database {
     }
 
     pub fn get_cpu_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceConfig);
         let s = &self.backend;
         return s
             .resource_config_elastic()
@@ -3130,6 +3206,7 @@ impl Database {
     }
 
     pub fn get_net_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceConfig);
         let s = &self.backend;
         return s
             .resource_config_elastic()
@@ -3151,6 +3228,7 @@ impl Database {
         net_weight: i64,
         cpu_weight: i64,
     ) -> Result<bool, ChainError> {
+        self.dependency_system_write(SystemKey::ResourceLimits(account_name));
         let s = &self.backend;
         // Compute the "ram limit decreased" flag from the pre-write limit, as
         // chainbase does, before applying the arena write.
@@ -3171,6 +3249,7 @@ impl Database {
         net_weight: &mut i64,
         cpu_weight: &mut i64,
     ) -> Result<(), ChainError> {
+        self.dependency_system_read(SystemKey::ResourceLimits(account_name));
         let s = &self.backend;
         let (r, n, c) = s.account_limits(account_name).ok_or_else(|| {
             ChainError::InternalError(format!("resource limits not found: {account_name}"))
@@ -3182,6 +3261,7 @@ impl Database {
     }
 
     pub fn get_total_cpu_weight(&self) -> Result<u64, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         return s
             .state_total_weights()
@@ -3190,6 +3270,7 @@ impl Database {
     }
 
     pub fn get_total_net_weight(&self) -> Result<u64, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         return s
             .state_total_weights()
@@ -3202,6 +3283,10 @@ impl Database {
         name: u64,
         greylist_limit: u32,
     ) -> Result<NetLimitResult, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceLimits(name));
+        self.dependency_system_read(SystemKey::ResourceUsage(name));
+        self.dependency_system_read(SystemKey::ResourceConfig);
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         let (limit, greylisted) = s.account_net_limit(name, greylist_limit).ok_or_else(|| {
             ChainError::InternalError(format!("resource state not found for {name}"))
@@ -3214,6 +3299,10 @@ impl Database {
         name: u64,
         greylist_limit: u32,
     ) -> Result<CpuLimitResult, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceLimits(name));
+        self.dependency_system_read(SystemKey::ResourceUsage(name));
+        self.dependency_system_read(SystemKey::ResourceConfig);
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         let (limit, greylisted) = s.account_cpu_limit(name, greylist_limit).ok_or_else(|| {
             ChainError::InternalError(format!("resource state not found for {name}"))
@@ -3240,6 +3329,7 @@ impl Database {
         cpu_limit_parameters: &ElasticLimitParameters,
         net_limit_parameters: &ElasticLimitParameters,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::ResourceConfig);
         let s = &self.backend;
         return s
             .set_block_parameters(
@@ -3255,6 +3345,8 @@ impl Database {
     }
 
     pub fn process_block_usage(&mut self, block_num: u32) -> Result<(), ChainError> {
+        self.dependency_system_read(SystemKey::ResourceConfig);
+        self.dependency_system_write(SystemKey::ResourceState);
         let s = &self.backend;
         let (cpu, net) = s.resource_config_elastic().ok_or_else(|| {
             ChainError::InternalError("resource config not found for block usage".into())
@@ -3697,6 +3789,7 @@ impl Database {
     }
 
     pub fn is_account(&self, account: u64) -> Result<bool, ChainError> {
+        self.dependency_system_read(SystemKey::Account(account));
         let s = &self.backend;
         return Ok(s.account_exists(account));
     }
@@ -3705,6 +3798,7 @@ impl Database {
     /// as owned scalars from the Rust database. Both feed the receipt digest.
     /// Errors when the account has no metadata.
     pub fn account_metadata_code_abi_sequence(&self, name: u64) -> Result<(u64, u64), ChainError> {
+        self.dependency_system_read(SystemKey::AccountMetadata(name));
         let s = &self.backend;
         return s.account_metadata(name).map(|t| (t.3, t.4)).ok_or_else(|| {
             ChainError::InternalError(format!("account metadata not found for account: {}", name))
@@ -3714,6 +3808,7 @@ impl Database {
     /// Whether `name` is a privileged account. A plain bool read off
     /// account_metadata. Errors when the account has no metadata.
     pub fn is_account_privileged(&self, name: u64) -> Result<bool, ChainError> {
+        self.dependency_system_read(SystemKey::AccountMetadata(name));
         let s = &self.backend;
         return s.account_metadata_privileged(name).ok_or_else(|| {
             ChainError::InternalError(format!("account metadata not found for account: {}", name))
@@ -3724,6 +3819,7 @@ impl Database {
     /// setcode reads off `account_metadata` to decide whether code is deployed
     /// and to locate the old code object.
     pub fn account_code_hash_vm(&self, name: u64) -> Result<([u8; 32], u8, u8), ChainError> {
+        self.dependency_system_read(SystemKey::AccountMetadata(name));
         let s = &self.backend;
         return s
             .account_metadata(name)
@@ -3738,6 +3834,7 @@ impl Database {
 
     /// The full code metadata tuple exposed by Leap's `get_code_hash` intrinsic.
     pub fn account_code_info(&self, name: u64) -> Result<(u64, [u8; 32], u8, u8), ChainError> {
+        self.dependency_system_read(SystemKey::AccountMetadata(name));
         let s = &self.backend;
         Ok(s.account_metadata(name)
             .map(|t| (t.3, t.5, t.6, t.7))
@@ -3747,6 +3844,7 @@ impl Database {
     /// The byte size of the account's stored ABI — what setabi bills RAM against.
     /// A plain length read from the account row.
     pub fn account_abi_size(&self, name: u64) -> Result<usize, ChainError> {
+        self.dependency_system_read(SystemKey::Account(name));
         let s = &self.backend;
         return s
             .account_abi_size(name)
@@ -3754,6 +3852,15 @@ impl Database {
     }
 
     pub fn delete_auth(&mut self, account: u64, permission_name: u64) -> Result<i64, ChainError> {
+        self.dependency_system_range_read(SystemRangeKey::PermissionsByOwner(account));
+        self.dependency_system_write(SystemKey::Permission {
+            owner: account,
+            name: permission_name,
+        });
+        self.dependency_system_write(SystemKey::PermissionUsage {
+            owner: account,
+            name: permission_name,
+        });
         // A permission with children cannot be removed — chainbase enforced this
         // via the by-parent index; the arena checks the same by name.
         let has_children = self
@@ -3801,6 +3908,11 @@ impl Database {
         requirement_name: u64,
         requirement_type: u64,
     ) -> Result<i64, ChainError> {
+        self.dependency_system_write(SystemKey::PermissionLink {
+            account: account_name,
+            code: code_name,
+            message_type: requirement_type,
+        });
         // The link's message_type is the requirement_type and its
         // required_permission is the requirement_name. Creating a new link bills
         // `billable_size_v<permission_link_object>`; updating an existing one to a
@@ -3831,6 +3943,11 @@ impl Database {
         code_name: u64,
         requirement_type: u64,
     ) -> Result<i64, ChainError> {
+        self.dependency_system_write(SystemKey::PermissionLink {
+            account: account_name,
+            code: code_name,
+            message_type: requirement_type,
+        });
         // Removing an existing link refunds `billable_size_v<permission_link_object>`
         // (apply_pulse_unlinkauth); a missing link is a no-op.
         let existed = self
@@ -3860,11 +3977,13 @@ impl Database {
 
     /// Ordered protocol features waiting for a block-header activation.
     pub fn preactivated_protocol_features(&self) -> Vec<[u8; 32]> {
+        self.dependency_system_read(SystemKey::PreactivatedProtocolFeatures);
         self.backend.preactivated_protocol_features()
     }
 
     /// Queue a feature from the privileged `preactivate_feature` intrinsic.
     pub fn preactivate_protocol_feature(&self, feature_digest: [u8; 32]) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::PreactivatedProtocolFeatures);
         let spec = protocol_feature_spec(feature_digest).ok_or_else(|| {
             ChainError::InternalError(format!(
                 "unrecognized protocol feature {}",
@@ -3901,6 +4020,10 @@ impl Database {
         feature_digests: &[[u8; 32]],
         activation_block_num: u32,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::PreactivatedProtocolFeatures);
+        for feature_digest in feature_digests {
+            self.dependency_system_write(SystemKey::ProtocolFeature(*feature_digest));
+        }
         let queued = self.preactivated_protocol_features();
         if queued
             .iter()
@@ -3964,6 +4087,7 @@ impl Database {
         vm_type: u8,
         vm_version: u8,
     ) -> Result<Vec<u8>, ChainError> {
+        self.dependency_system_read(SystemKey::Code(*code_hash));
         self.backend
             .code_by_hash(*code_hash, vm_type, vm_version)
             .ok_or_else(|| ChainError::InternalError("code object not found".to_string()))
@@ -3975,6 +4099,7 @@ impl Database {
     /// inside this method, so no database-bound reference escapes into execution.
     /// The returned sequence lands in the `ActionReceipt` digest.
     pub fn next_recv_sequence(&mut self, receiver: u64) -> Result<u64, ChainError> {
+        self.dependency_system_write(SystemKey::AccountMetadata(receiver));
         let s = &self.backend;
         return s
             .next_recv_sequence(receiver)
@@ -3988,6 +4113,7 @@ impl Database {
     }
 
     pub fn next_auth_sequence(&mut self, actor: u64) -> Result<u64, ChainError> {
+        self.dependency_system_write(SystemKey::AccountMetadata(actor));
         let s = &self.backend;
         s.next_auth_sequence(actor)
             .map_err(|e| ChainError::InternalError(format!("arena next_auth_sequence: {e:?}")))?;
@@ -4001,6 +4127,7 @@ impl Database {
     }
 
     pub fn next_global_sequence(&mut self) -> Result<u64, ChainError> {
+        self.dependency_system_write(SystemKey::GlobalActionSequence);
         let s = &self.backend;
         // Chainbase does ++global_action_sequence and returns it; the database
         // stores that post-increment value, so the arena authors the next by
@@ -4016,6 +4143,7 @@ impl Database {
     }
 
     pub fn get_global_action_sequence(&self) -> Result<u64, ChainError> {
+        self.dependency_system_read(SystemKey::GlobalActionSequence);
         Ok(self.backend.global_action_sequence().unwrap_or(0))
     }
 
@@ -4033,6 +4161,15 @@ impl Database {
         auth: &Authority,
         creation_time: &TimePoint,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::PermissionSequence);
+        self.dependency_system_write(SystemKey::Permission {
+            owner: account,
+            name,
+        });
+        self.dependency_system_write(SystemKey::PermissionUsage {
+            owner: account,
+            name,
+        });
         let s = &self.backend;
         let authored = s
             .next_permission_id()
@@ -4055,6 +4192,10 @@ impl Database {
         authority: &Authority,
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::Permission {
+            owner: actor,
+            name: permission,
+        });
         let s = &self.backend;
         return s
             .modify_permission(
@@ -4072,6 +4213,16 @@ impl Database {
         permission: u64,
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
+        // The usage row is reached through the permission's stored usage id,
+        // so a delete/recreate of the permission invalidates this observation.
+        self.dependency_system_read(SystemKey::Permission {
+            owner: actor,
+            name: permission,
+        });
+        self.dependency_system_write(SystemKey::PermissionUsage {
+            owner: actor,
+            name: permission,
+        });
         let s = &self.backend;
         return s
             .update_permission_usage(actor, permission, pending_block_time.elapsed.count)
@@ -4081,6 +4232,7 @@ impl Database {
     }
 
     pub fn set_global_properties(&self, cfg: &ChainConfigV0) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::ChainConfig);
         self.backend
             .set_global_properties(chain_config_params_from_v0(cfg))
             .map_err(|e| ChainError::InternalError(format!("arena set_global_properties: {e:?}")))
@@ -4091,6 +4243,7 @@ impl Database {
         block_num: u32,
         packed_schedule: &[u8],
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::ProposedSchedule);
         self.backend
             .set_proposed_schedule(block_num, packed_schedule)
             .map_err(|error| {
@@ -4099,10 +4252,12 @@ impl Database {
     }
 
     pub fn proposed_schedule(&self) -> Option<(u32, Vec<u8>)> {
+        self.dependency_system_read(SystemKey::ProposedSchedule);
         self.backend.proposed_schedule()
     }
 
     pub fn clear_proposed_schedule(&self) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::ProposedSchedule);
         self.backend.clear_proposed_schedule().map_err(|error| {
             ChainError::InternalError(format!("arena clear_proposed_schedule: {error:?}"))
         })
@@ -4118,6 +4273,7 @@ impl Database {
     /// The active runtime `chain_config`, served as an owned value from the
     /// arena's `global_property_object` representation.
     pub fn chain_config(&self) -> Result<ChainConfigV0, ChainError> {
+        self.dependency_system_read(SystemKey::ChainConfig);
         let s = &self.backend;
         let p = s
             .chain_config_params()
@@ -4136,10 +4292,12 @@ impl Database {
     }
 
     pub fn protocol_feature_activated(&self, feature_digest: [u8; 32]) -> bool {
+        self.dependency_system_read(SystemKey::ProtocolFeature(feature_digest));
         self.backend.protocol_feature_activated(feature_digest)
     }
 
     pub fn get_virtual_block_cpu_limit(&self) -> Result<u64, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         return s
             .state_virtual_limits()
@@ -4148,6 +4306,7 @@ impl Database {
     }
 
     pub fn get_virtual_block_net_limit(&self) -> Result<u64, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         return s
             .state_virtual_limits()
@@ -4156,6 +4315,7 @@ impl Database {
     }
 
     pub fn get_block_cpu_limit(&self) -> Result<u64, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         return s
             .block_limits()
@@ -4164,6 +4324,7 @@ impl Database {
     }
 
     pub fn get_block_net_limit(&self) -> Result<u64, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         return s
             .block_limits()
@@ -4172,6 +4333,7 @@ impl Database {
     }
 
     pub fn is_known_unexpired_transaction(&self, trx_id: &[u8; 32]) -> Result<bool, ChainError> {
+        self.dependency_system_read(SystemKey::Transaction(*trx_id));
         Ok(self.backend.transaction_exists(*trx_id))
     }
 
@@ -4180,6 +4342,7 @@ impl Database {
         trx_id: &[u8; 32],
         expiration: u32,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::Transaction(*trx_id));
         self.backend
             .record_transaction(*trx_id, expiration)
             .map_err(|e| ChainError::InternalError(format!("arena record_transaction: {e:?}")))
@@ -4187,6 +4350,7 @@ impl Database {
 
     /// Whether the arena holds a dedupe row for `trx_id`.
     pub fn arena_transaction_exists(&self, trx_id: &[u8; 32]) -> bool {
+        self.dependency_system_read(SystemKey::Transaction(*trx_id));
         self.backend.transaction_exists(*trx_id)
     }
 
@@ -5314,52 +5478,303 @@ mod tests {
         assert_eq!(
             report.exact_reads(),
             &BTreeSet::from([
-                ContractRowKey::table(code, scope, table),
-                ContractRowKey::new(code, scope, table, ContractIndex::Primary, primary),
+                DependencyKey::Contract(ContractRowKey::table(code, scope, table)),
+                DependencyKey::Contract(ContractRowKey::new(
+                    code,
+                    scope,
+                    table,
+                    ContractIndex::Primary,
+                    primary,
+                )),
             ])
         );
         assert_eq!(
             report.range_reads(),
-            &BTreeSet::from([ContractRangeKey::new(
+            &BTreeSet::from([RangeDependency::Contract(ContractRangeKey::new(
                 code,
                 scope,
                 table,
                 ContractIndex::Primary,
-            )])
+            ))])
         );
         assert_eq!(
             report.writes(),
             &BTreeSet::from([
-                ContractRowKey::table(code, scope, table),
-                ContractRowKey::new(code, scope, table, ContractIndex::Primary, primary),
+                DependencyKey::Contract(ContractRowKey::table(code, scope, table)),
+                DependencyKey::Contract(ContractRowKey::new(
+                    code,
+                    scope,
+                    table,
+                    ContractIndex::Primary,
+                    primary,
+                )),
             ])
         );
         assert!(!report.is_complete());
     }
 
     #[test]
+    fn system_dependency_tracking_flows_through_read_views_and_clones() {
+        let db = Database::default();
+        let owner = name_u64("alice");
+        let owner_permission = name_u64("owner");
+        let active_permission = name_u64("active");
+        let custom_permission = name_u64("custom");
+        let code = name_u64("token");
+        let action = name_u64("transfer");
+        let sender_id = 99u128;
+        let deferred_id = [7; 32];
+        let code_hash = [6; 32];
+        let auth = build_auth_blob(1, &[], &[], &[]);
+        let owner_id = db
+            .xpr_import_permission(0, owner, owner_permission, 10, &auth)
+            .unwrap();
+        db.xpr_import_permission(owner_id, owner, active_permission, 10, &auth)
+            .unwrap();
+        db.xpr_import_permission_link(owner, code, action, active_permission)
+            .unwrap();
+        db.xpr_import_deferred_transaction(
+            owner,
+            sender_id,
+            owner,
+            deferred_id,
+            20,
+            100,
+            10,
+            &[1, 2, 3],
+        )
+        .unwrap();
+
+        let (mut tracked, tracker) = db.clone_with_dependency_tracking();
+        tracked.create_account(code, 0).unwrap();
+        tracked.create_account_metadata(code, false).unwrap();
+        tracked
+            .update_account_code(code, b"wasm", 1, &TimePoint::default(), &code_hash, 0, 0)
+            .unwrap();
+        assert_eq!(
+            tracked.get_code_bytes_by_hash(&code_hash, 0, 0).unwrap(),
+            b"wasm"
+        );
+        let read_view = tracked.read().unwrap();
+        assert!(
+            read_view
+                .permission_authority(owner, active_permission)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            read_view
+                .permission_satisfies_by_name(owner, active_permission, owner, active_permission)
+                .unwrap()
+        );
+        assert_eq!(
+            read_view
+                .lookup_linked_permission(owner, code, action)
+                .unwrap(),
+            Some(active_permission)
+        );
+        assert_eq!(
+            tracked
+                .arena_deferred_transaction_by_sender_id(owner, sender_id)
+                .unwrap()
+                .trx_id,
+            deferred_id
+        );
+        assert_eq!(tracked.arena_due_deferred_transactions(20).len(), 1);
+        assert_eq!(
+            tracked
+                .arena_remove_deferred_transaction_by_sender_id(owner, sender_id)
+                .unwrap()
+                .unwrap()
+                .trx_id,
+            deferred_id
+        );
+
+        tracked
+            .modify_permission(
+                owner,
+                active_permission,
+                &decode_authority(&auth).unwrap(),
+                &TimePoint::default(),
+            )
+            .unwrap();
+        tracked
+            .create_permission(
+                owner,
+                custom_permission,
+                owner_id as u64,
+                &decode_authority(&auth).unwrap(),
+                &TimePoint::default(),
+            )
+            .unwrap();
+        tracked
+            .update_permission_usage(owner, active_permission, &TimePoint::default())
+            .unwrap();
+        tracked.record_transaction(&[8; 32], 100).unwrap();
+
+        let report = tracker.snapshot();
+        assert!(
+            report
+                .exact_reads()
+                .contains(&DependencyKey::System(SystemKey::Permission {
+                    owner,
+                    name: active_permission,
+                }))
+        );
+        assert!(
+            report
+                .exact_reads()
+                .contains(&DependencyKey::System(SystemKey::Code(code_hash)))
+        );
+        assert!(
+            report
+                .exact_reads()
+                .contains(&DependencyKey::System(SystemKey::PermissionLink {
+                    account: owner,
+                    code,
+                    message_type: action,
+                }))
+        );
+        assert!(
+            report
+                .exact_reads()
+                .contains(&DependencyKey::System(SystemKey::DeferredSender {
+                    sender: owner,
+                    sender_id,
+                }))
+        );
+        assert!(report.range_reads().contains(&RangeDependency::System(
+            SystemRangeKey::PermissionsByOwner(owner),
+        )));
+        assert!(
+            report
+                .range_reads()
+                .contains(&RangeDependency::System(SystemRangeKey::DeferredDueQueue))
+        );
+        assert!(
+            report
+                .writes()
+                .contains(&DependencyKey::System(SystemKey::Permission {
+                    owner,
+                    name: active_permission,
+                }))
+        );
+        for write in [
+            SystemKey::DeferredSender {
+                sender: owner,
+                sender_id,
+            },
+            SystemKey::DeferredTransaction(deferred_id),
+        ] {
+            assert!(report.writes().contains(&DependencyKey::System(write)));
+        }
+        for write in [
+            SystemKey::PermissionSequence,
+            SystemKey::Permission {
+                owner,
+                name: custom_permission,
+            },
+            SystemKey::PermissionUsage {
+                owner,
+                name: custom_permission,
+            },
+        ] {
+            assert!(report.writes().contains(&DependencyKey::System(write)));
+        }
+        for write in [SystemKey::Account(code), SystemKey::AccountMetadata(code)] {
+            assert!(report.writes().contains(&DependencyKey::System(write)));
+        }
+        assert!(
+            report
+                .writes()
+                .contains(&DependencyKey::System(SystemKey::Code(code_hash)))
+        );
+        assert!(
+            report
+                .writes()
+                .contains(&DependencyKey::System(SystemKey::PermissionUsage {
+                    owner,
+                    name: active_permission,
+                }))
+        );
+        assert!(
+            report
+                .writes()
+                .contains(&DependencyKey::System(SystemKey::Transaction([8; 32])))
+        );
+        assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn system_dependency_tracking_covers_runtime_singletons_and_resources() {
+        let (_dir, db) = initialized_resource_db();
+        let system = db.system_accounts().system.as_u64();
+        let feature = [0xa5; 32];
+        let (mut tracked, tracker) = db.clone_with_dependency_tracking();
+
+        let config = tracked.chain_config().unwrap();
+        tracked.set_global_properties(&config).unwrap();
+        assert!(!tracked.protocol_feature_activated(feature));
+        assert!(tracked.preactivated_protocol_features().is_empty());
+        assert!(tracked.proposed_schedule().is_none());
+        tracked.set_proposed_schedule(1, &[1, 2, 3]).unwrap();
+        tracked.clear_proposed_schedule().unwrap();
+        tracked.get_block_cpu_limit().unwrap();
+        tracked.get_block_net_limit().unwrap();
+        tracked.get_account_ram_usage(system).unwrap();
+        tracked.add_pending_ram_usage(system, 0).unwrap();
+        tracked.next_recv_sequence(system).unwrap();
+        tracked.next_global_sequence().unwrap();
+
+        let report = tracker.snapshot();
+        for read in [
+            SystemKey::ChainConfig,
+            SystemKey::ProtocolFeature(feature),
+            SystemKey::PreactivatedProtocolFeatures,
+            SystemKey::ProposedSchedule,
+            SystemKey::ResourceState,
+            SystemKey::ResourceUsage(system),
+        ] {
+            assert!(report.exact_reads().contains(&DependencyKey::System(read)));
+        }
+        for write in [
+            SystemKey::ChainConfig,
+            SystemKey::ProposedSchedule,
+            SystemKey::ResourceUsage(system),
+            SystemKey::AccountMetadata(system),
+            SystemKey::GlobalActionSequence,
+        ] {
+            assert!(report.writes().contains(&DependencyKey::System(write)));
+        }
+        assert!(!report.is_complete());
+    }
+
+    #[test]
     fn dependency_tracking_does_not_change_arena_state() {
-        fn apply(db: &Database) {
+        fn apply(db: &mut Database) {
             db.create_key_value_object_standalone(10, 20, 30, 40, 50, b"same")
                 .unwrap();
             db.create_index64_object_standalone(10, 20, 31, 40, 50, 60)
                 .unwrap();
             db.update_index64_object_standalone(10, 20, 31, 50, 41, 61)
                 .unwrap();
+            db.create_account(70, 80).unwrap();
+            db.create_account_metadata(70, false).unwrap();
+            db.record_transaction(&[90; 32], 100).unwrap();
         }
 
-        let untracked = Database::default();
-        apply(&untracked);
+        let mut untracked = Database::default();
+        apply(&mut untracked);
 
         let tracked_base = Database::default();
-        let (tracked, tracker) = tracked_base.clone_with_dependency_tracking();
-        apply(&tracked);
+        let (mut tracked, tracker) = tracked_base.clone_with_dependency_tracking();
+        apply(&mut tracked);
 
         assert_eq!(untracked.arena_state_root(), tracked.arena_state_root());
         let report = tracker.snapshot();
         assert_eq!(report.exact_read_count(), 0);
         assert_eq!(report.range_read_count(), 0);
-        assert_eq!(report.write_count(), 4);
+        assert_eq!(report.write_count(), 7);
     }
 }
 
@@ -5370,6 +5785,7 @@ impl Database {
     pub fn read(&self) -> Result<DbRead<'_>, ChainError> {
         Ok(DbRead {
             backend: self.backend.clone(),
+            dependency_recorder: self.dependency_recorder.clone(),
             _marker: std::marker::PhantomData,
         })
     }
@@ -5379,6 +5795,7 @@ impl Database {
 /// lifetime is retained for source compatibility with call sites that name it.
 pub struct DbRead<'g> {
     backend: crate::backend::ChainDatabase,
+    dependency_recorder: Option<DependencyRecorder>,
     _marker: std::marker::PhantomData<&'g ()>,
 }
 
@@ -5428,6 +5845,18 @@ impl PermissionInfo {
 }
 
 impl<'g> DbRead<'g> {
+    fn dependency_system_read(&self, key: SystemKey) {
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.exact_read(DependencyKey::System(key));
+        }
+    }
+
+    fn dependency_system_range_read(&self, key: SystemRangeKey) {
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.range_read(RangeDependency::System(key));
+        }
+    }
+
     /// The full authority for `(actor, permission)` as an owned value, or `None`
     /// if the permission doesn't exist.
     ///
@@ -5439,6 +5868,10 @@ impl<'g> DbRead<'g> {
         actor: u64,
         permission: u64,
     ) -> Result<Option<Authority>, ChainError> {
+        self.dependency_system_read(SystemKey::Permission {
+            owner: actor,
+            name: permission,
+        });
         let s = &self.backend;
         return match s.permission_auth_blob(actor, permission) {
             Some(blob) => Ok(Some(decode_authority(&blob)?)),
@@ -5449,6 +5882,10 @@ impl<'g> DbRead<'g> {
     /// The permission's consensus id. `newaccount` reads the owner permission's
     /// id here to parent the active permission on it.
     pub fn permission_id(&self, owner: u64, perm_name: u64) -> Result<Option<i64>, ChainError> {
+        self.dependency_system_read(SystemKey::Permission {
+            owner,
+            name: perm_name,
+        });
         let s = &self.backend;
         return Ok(s.permission_cb_id(owner, perm_name));
     }
@@ -5462,6 +5899,10 @@ impl<'g> DbRead<'g> {
         owner: u64,
         perm_name: u64,
     ) -> Result<Option<i64>, ChainError> {
+        self.dependency_system_read(SystemKey::Permission {
+            owner,
+            name: perm_name,
+        });
         let s = &self.backend;
         return Ok(s
             .permission_auth_blob(owner, perm_name)
@@ -5475,6 +5916,10 @@ impl<'g> DbRead<'g> {
         actor: u64,
         permission: u64,
     ) -> Result<Option<PermissionInfo>, ChainError> {
+        self.dependency_system_read(SystemKey::Permission {
+            owner: actor,
+            name: permission,
+        });
         let s = &self.backend;
         return Ok(Self::arena_permission_info(s, actor, permission));
     }
@@ -5511,6 +5956,13 @@ impl<'g> DbRead<'g> {
         owner_b: u64,
         name_b: u64,
     ) -> Result<bool, ChainError> {
+        // The backend walks the permission parent tree. Depending on the whole
+        // owner's permission set is conservative, including absent parents and
+        // hierarchy changes without exposing arena-internal numeric row ids.
+        self.dependency_system_range_read(SystemRangeKey::PermissionsByOwner(owner_a));
+        if owner_b != owner_a {
+            self.dependency_system_range_read(SystemRangeKey::PermissionsByOwner(owner_b));
+        }
         let s = &self.backend;
         return s
             .permission_satisfies(owner_a, name_a, owner_b, name_b)
@@ -5523,6 +5975,8 @@ impl<'g> DbRead<'g> {
 
     /// The `last_used` microsecond timestamp of a permission, by name.
     pub fn permission_last_used_by_name(&self, owner: u64, name: u64) -> Result<i64, ChainError> {
+        self.dependency_system_read(SystemKey::Permission { owner, name });
+        self.dependency_system_read(SystemKey::PermissionUsage { owner, name });
         let s = &self.backend;
         return s.permission_last_used(owner, name).ok_or_else(|| {
             ChainError::InternalError(
@@ -5537,6 +5991,11 @@ impl<'g> DbRead<'g> {
         code: u64,
         requirement_type: u64,
     ) -> Result<Option<u64>, ChainError> {
+        self.dependency_system_read(SystemKey::PermissionLink {
+            account,
+            code,
+            message_type: requirement_type,
+        });
         let s = &self.backend;
         return Ok(s.permission_link(account, code, requirement_type));
     }

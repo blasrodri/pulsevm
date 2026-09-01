@@ -25,7 +25,11 @@ pub use crate::{
         ContractIndex,
         ContractRangeKey,
         ContractRowKey,
+        DependencyKey,
         DependencyTracker,
+        RangeDependency,
+        SystemKey,
+        SystemRangeKey,
         TransactionDependencies,
     },
     objects::{
