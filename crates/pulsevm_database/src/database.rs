@@ -1,6 +1,7 @@
 #![allow(clippy::needless_return, clippy::too_many_arguments)]
 
 use std::{
+    collections::HashMap,
     fs,
     io::{
         Read,
@@ -639,6 +640,13 @@ pub struct Database {
     /// Guards the currently supported live contract-primary write surface while
     /// a speculative wave owns the canonical controller handle.
     speculation_freeze: Arc<AtomicBool>,
+    /// Decoding a K1 authority includes public-key decompression. Cache the
+    /// immutable result by its complete canonical blob so permission updates
+    /// cannot return a stale authority.
+    authority_cache: Arc<Mutex<HashMap<Vec<u8>, Authority>>>,
+    /// Non-persisted capability used only by the offline XPR replay tool.
+    /// Production VM construction leaves it false.
+    xpr_native_replay: Arc<AtomicBool>,
 }
 
 /// The staged arena checkpoint file used to move a snapshot through the transport
@@ -738,6 +746,8 @@ impl Database {
             dependency_recorder: None,
             speculation_epoch: Arc::new(OnceLock::new()),
             speculation_freeze: Arc::new(AtomicBool::new(false)),
+            authority_cache: Arc::new(Mutex::new(HashMap::new())),
+            xpr_native_replay: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -5237,6 +5247,33 @@ mod tests {
     }
 
     #[test]
+    fn authority_cache_keys_entries_by_complete_blob() {
+        let db = Database::default();
+        let read = db.read().unwrap();
+        let first = Authority::new(1, Vec::new(), Vec::new(), Vec::new());
+        let second = Authority::new(2, Vec::new(), Vec::new(), Vec::new());
+        let first_blob = encode_authority(&first);
+        let second_blob = encode_authority(&second);
+
+        assert_eq!(read.decode_authority_cached(&first_blob).unwrap(), first);
+        assert_eq!(read.decode_authority_cached(&first_blob).unwrap(), first);
+        assert_eq!(read.decode_authority_cached(&second_blob).unwrap(), second);
+        assert_eq!(read.authority_cache.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn native_xpr_replay_capability_is_default_off_and_shared_only_in_process() {
+        let database = Database::default();
+        let clone = database.clone();
+        assert!(!database.xpr_native_replay_enabled());
+        clone.enable_xpr_native_replay();
+        assert!(database.xpr_native_replay_enabled());
+
+        let independent = Database::default();
+        assert!(!independent.xpr_native_replay_enabled());
+    }
+
+    #[test]
     fn webauthn_authority_round_trips_through_arena_blob() {
         let key = AuthorityPublicKey::WebAuthn {
             point: [
@@ -5862,6 +5899,19 @@ mod tests {
 }
 
 impl Database {
+    /// Enable code-hash-pinned XPR native handlers for this process-local
+    /// database handle and its clones. Intended only for the offline importer.
+    #[doc(hidden)]
+    pub fn enable_xpr_native_replay(&self) {
+        self.xpr_native_replay.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the offline importer explicitly enabled native XPR handlers.
+    #[doc(hidden)]
+    pub fn xpr_native_replay_enabled(&self) -> bool {
+        self.xpr_native_replay.load(Ordering::Relaxed)
+    }
+
     /// Acquire a read view over the arena. The arena is `Arc`-backed with its own
     /// interior synchronization, so the view is a cheap clone that carries no
     /// borrow of `self`.
@@ -5869,6 +5919,7 @@ impl Database {
         Ok(DbRead {
             backend: self.backend.clone(),
             dependency_recorder: self.dependency_recorder.clone(),
+            authority_cache: self.authority_cache.clone(),
             _marker: std::marker::PhantomData,
         })
     }
@@ -5879,6 +5930,7 @@ impl Database {
 pub struct DbRead<'g> {
     backend: crate::backend::ChainDatabase,
     dependency_recorder: Option<DependencyRecorder>,
+    authority_cache: Arc<Mutex<HashMap<Vec<u8>, Authority>>>,
     _marker: std::marker::PhantomData<&'g ()>,
 }
 
@@ -5928,6 +5980,31 @@ impl PermissionInfo {
 }
 
 impl<'g> DbRead<'g> {
+    fn decode_authority_cached(&self, blob: &[u8]) -> Result<Authority, ChainError> {
+        const MAX_CACHED_AUTHORITIES: usize = 4_096;
+
+        if let Some(authority) = self
+            .authority_cache
+            .lock()
+            .map_err(|_| ChainError::InternalError("authority cache lock poisoned".into()))?
+            .get(blob)
+            .cloned()
+        {
+            return Ok(authority);
+        }
+
+        let authority = decode_authority(blob)?;
+        let mut cache = self
+            .authority_cache
+            .lock()
+            .map_err(|_| ChainError::InternalError("authority cache lock poisoned".into()))?;
+        if cache.len() >= MAX_CACHED_AUTHORITIES {
+            cache.clear();
+        }
+        cache.insert(blob.to_vec(), authority.clone());
+        Ok(authority)
+    }
+
     fn dependency_system_read(&self, key: SystemKey) {
         if let Some(recorder) = &self.dependency_recorder {
             recorder.exact_read(DependencyKey::System(key));
@@ -5957,7 +6034,7 @@ impl<'g> DbRead<'g> {
         });
         let s = &self.backend;
         return match s.permission_auth_blob(actor, permission) {
-            Some(blob) => Ok(Some(decode_authority(&blob)?)),
+            Some(blob) => Ok(Some(self.decode_authority_cached(&blob)?)),
             None => Ok(None),
         };
     }
@@ -6096,6 +6173,8 @@ impl Default for Database {
             dependency_recorder: None,
             speculation_epoch: Arc::new(OnceLock::new()),
             speculation_freeze: Arc::new(AtomicBool::new(false)),
+            authority_cache: Arc::new(Mutex::new(HashMap::new())),
+            xpr_native_replay: Arc::new(AtomicBool::new(false)),
         }
     }
 }

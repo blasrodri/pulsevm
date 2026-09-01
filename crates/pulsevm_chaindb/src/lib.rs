@@ -9,12 +9,13 @@
 //! The database handle lives in the `Database` wrapper (not in the controller) so that
 //! every `Database` clone — and there is one per apply/transaction context —
 //! shares the same arena through an `Arc`, and writes reach it with no change at
-//! the call sites. The arena is single-threaded (`Db: !Sync`); the `Mutex`
-//! serialises access. Never hold the guard across an `.await`.
+//! the call sites. A writer remains exclusive, while immutable speculative
+//! snapshots can read the frozen block prefix concurrently. Never hold a guard
+//! across an `.await`.
 
 use std::sync::{
     Arc,
-    Mutex,
+    RwLock,
 };
 
 mod history;
@@ -1341,7 +1342,7 @@ fn contract_table_decr(db: &mut Db, t_id: i64) -> Result<(), DbError> {
 /// A cheaply cloned, `Send + Sync` handle to the chain database.
 #[derive(Clone)]
 pub struct ChainDatabase {
-    inner: Arc<Mutex<Db>>,
+    inner: Arc<RwLock<Db>>,
 }
 
 /// Builds an empty `Db` with every chain table registered. Shared by
@@ -1408,12 +1409,16 @@ impl ChainDatabase {
     pub fn new() -> Result<Self, DbError> {
         let db = build_registered_db()?;
         Ok(ChainDatabase {
-            inner: Arc::new(Mutex::new(db)),
+            inner: Arc::new(RwLock::new(db)),
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Db> {
-        self.inner.lock().expect("chain database mutex poisoned")
+    fn lock(&self) -> std::sync::RwLockWriteGuard<'_, Db> {
+        self.inner.write().expect("chain database lock poisoned")
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Db> {
+        self.inner.read().expect("chain database lock poisoned")
     }
 
     /// Serialize the block's SHiP chain-state `table_delta` stream over the
@@ -1424,7 +1429,7 @@ impl ChainDatabase {
     /// resolvable. `chain_id` supplies the one `global_property` field the arena
     /// does not store.
     pub fn pack_deltas(&self, full_snapshot: bool, chain_id: &[u8; 32]) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         history::pack_deltas(&db, full_snapshot, chain_id)
     }
 
@@ -1436,7 +1441,7 @@ impl ChainDatabase {
     /// to). Drives the controller's genesis-vs-resume decision now that the arena
     /// is the sole backend.
     pub fn revision(&self) -> i64 {
-        self.lock().revision()
+        self.read().revision()
     }
 
     // Lifecycle, driven from the controller in lockstep with the chainbase
@@ -1455,7 +1460,7 @@ impl ChainDatabase {
     }
 
     pub fn state_root(&self) -> [u8; 32] {
-        self.lock().state_root()
+        self.read().state_root()
     }
 
     // ----- ported mutations -------------------------------------------------
@@ -1545,7 +1550,7 @@ impl ChainDatabase {
     /// Whether the database holds an account_metadata row for `name`, and its
     /// privileged flag — for diffing against chainbase.
     pub fn account_metadata_privileged(&self, name: u64) -> Option<bool> {
-        self.lock()
+        self.read()
             .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)
             .ok()
             .flatten()
@@ -1560,7 +1565,7 @@ impl ChainDatabase {
         &self,
         name: u64,
     ) -> Option<(bool, u64, u64, u64, u64, [u8; 32], u8, u8)> {
-        self.lock()
+        self.read()
             .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)
             .ok()
             .flatten()
@@ -1584,7 +1589,7 @@ impl ChainDatabase {
     /// same root when the tables hold the same logical state — a true
     /// cross-implementation state-root check over the full account set.
     pub fn account_metadata_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         #[allow(clippy::type_complexity)]
         let mut rows: Vec<(u64, bool, u64, u64, u64, u64, [u8; 32], u8, u8)> =
             match db.table::<AccountMetaRow>() {
@@ -1666,7 +1671,7 @@ impl ChainDatabase {
     /// Whether the database holds an account_object row for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn account_exists(&self, name: u64) -> bool {
-        self.lock()
+        self.read()
             .find_by::<AccountRow, AccountRowByName>(&name)
             .ok()
             .flatten()
@@ -1677,7 +1682,7 @@ impl ChainDatabase {
     /// for serving `AccountObject::get_creation_date` from the arena. `None` if
     /// the account is absent.
     pub fn account_creation_date(&self, name: u64) -> Option<u32> {
-        self.lock()
+        self.read()
             .find_by::<AccountRow, AccountRowByName>(&name)
             .ok()
             .flatten()
@@ -1688,7 +1693,7 @@ impl ChainDatabase {
     /// `AccountObject::get_abi().size()` from the arena (setabi bills RAM on it).
     /// `None` if the account is absent.
     pub fn account_abi_size(&self, name: u64) -> Option<usize> {
-        let db = self.lock();
+        let db = self.read();
         let abi_ref = db
             .find_by::<AccountRow, AccountRowByName>(&name)
             .ok()
@@ -1701,7 +1706,7 @@ impl ChainDatabase {
     /// formatters decode contract rows against. `None` if the account is absent
     /// (an account with no ABI yields an empty vec).
     pub fn account_abi_bytes(&self, name: u64) -> Option<Vec<u8>> {
-        let db = self.lock();
+        let db = self.read();
         let abi_ref = db
             .find_by::<AccountRow, AccountRowByName>(&name)
             .ok()
@@ -1717,7 +1722,7 @@ impl ChainDatabase {
     /// The account's `last_code_update` (fc microseconds), for the RPC account
     /// formatter. `None` if the account_metadata row is absent.
     pub fn account_last_code_update(&self, name: u64) -> Option<i64> {
-        self.lock()
+        self.read()
             .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)
             .ok()
             .flatten()
@@ -1826,7 +1831,7 @@ impl ChainDatabase {
     /// matching the chainbase `account_state_bytes` enumerator: per row name u64
     /// LE, creation_date slot u32 LE, then a u32 LE length-prefixed abi blob.
     pub fn account_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut refs: Vec<(u64, u32, BlobRef)> = match db.table::<AccountRow>() {
             Ok(t) => t.iter().map(|r| (r.name, r.creation_date, r.abi)).collect(),
             Err(_) => return Vec::new(),
@@ -1943,7 +1948,7 @@ impl ChainDatabase {
     /// threshold is the first field of the encoded `shared_authority` blob, so it
     /// is read straight off the blob without decoding the whole authority.
     pub fn permission(&self, owner: u64, perm_name: u64) -> Option<(i64, u32)> {
-        let db = self.lock();
+        let db = self.read();
         let (parent, auth) = db
             .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
             .ok()
@@ -1960,7 +1965,7 @@ impl ChainDatabase {
     /// permission); the auth blob is decoded by the caller.
     pub fn permissions_of(&self, owner: u64) -> Vec<(u64, u64, Vec<u8>)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let raw: Vec<(u64, i64, BlobRef)> = match db.table::<PermissionRow>() {
             Ok(tbl) => tbl
                 .get_index::<PermByOwner>()
@@ -1995,7 +2000,7 @@ impl ChainDatabase {
     /// The chainbase id a permission matches (`cb_id`), for serving `get_id` from
     /// the arena. `None` if the permission is absent.
     pub fn permission_cb_id(&self, owner: u64, perm_name: u64) -> Option<i64> {
-        let db = self.lock();
+        let db = self.read();
         db.find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
             .ok()
             .flatten()
@@ -2007,7 +2012,7 @@ impl ChainDatabase {
     /// `permission_state_bytes` does — for serving `get_permission_last_used`
     /// from the arena. `None` if the permission is absent.
     pub fn permission_last_used(&self, owner: u64, perm_name: u64) -> Option<i64> {
-        let db = self.lock();
+        let db = self.read();
         let usage_id = db
             .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
             .ok()
@@ -2023,7 +2028,7 @@ impl ChainDatabase {
     /// the database facade stored via `encode_authority`), for serving the whole
     /// authority — not just the threshold — from the arena. `None` if absent.
     pub fn permission_auth_blob(&self, owner: u64, perm_name: u64) -> Option<Vec<u8>> {
-        let db = self.lock();
+        let db = self.read();
         let auth = db
             .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
             .ok()
@@ -2044,7 +2049,7 @@ impl ChainDatabase {
         owner_b: u64,
         name_b: u64,
     ) -> Option<bool> {
-        let db = self.lock();
+        let db = self.read();
         let (a_owner, a_id) = db
             .find_by::<PermissionRow, PermByOwner>(&(owner_a, name_a))
             .ok()
@@ -2094,7 +2099,7 @@ impl ChainDatabase {
     /// directly and, on hydration, give the arena the chainbase id space its
     /// permission-tree walk needs.
     pub fn permission_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut refs: Vec<(u64, u64, i64, i64, i64, BlobRef)> = match db.table::<PermissionRow>() {
             Ok(t) => t
                 .iter()
@@ -2189,7 +2194,7 @@ impl ChainDatabase {
     /// Canonical serialization of permission_link in (account, code,
     /// message_type) order. No genesis rows (links come only from linkauth).
     pub fn permission_link_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut rows: Vec<(u64, u64, u64, u64)> = match db.table::<PermissionLinkRow>() {
             Ok(t) => t
                 .iter()
@@ -2212,7 +2217,7 @@ impl ChainDatabase {
     /// order: hash 32B, vm_type, vm_version, ref_count u64 LE, first_block u32 LE,
     /// then a u32 LE length-prefixed code blob. No genesis rows (setcode only).
     pub fn code_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut refs: Vec<([u8; 32], u8, u8, u64, u32, BlobRef)> = match db.table::<CodeRow>() {
             Ok(t) => t
                 .iter()
@@ -2247,7 +2252,7 @@ impl ChainDatabase {
     /// Canonical serialization of the transaction dedupe set in trx_id order:
     /// trx_id 32B, expiration u32 LE (seconds). No genesis rows.
     pub fn transaction_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut rows: Vec<([u8; 32], u32)> = match db.table::<TransactionRow>() {
             Ok(t) => t.iter().map(|t| (t.trx_id, t.expiration)).collect(),
             Err(_) => return Vec::new(),
@@ -2264,7 +2269,7 @@ impl ChainDatabase {
     /// Canonical serialization of resource_usage in owner order: owner u64 LE,
     /// ram_usage u64 LE, then the net and cpu accumulators.
     pub fn resource_usage_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut rows: Vec<(u64, u64, UsageAccumulator, UsageAccumulator)> =
             match db.table::<ResourceUsageRow>() {
                 Ok(t) => t
@@ -2322,7 +2327,7 @@ impl ChainDatabase {
 
     /// Canonical serialization of resource_limits in (pending, owner) order.
     pub fn account_limits_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut rows: Vec<(u8, u64, i64, i64, i64)> = match db.table::<ResourceLimitsRow>() {
             Ok(t) => t
                 .iter()
@@ -2377,7 +2382,7 @@ impl ChainDatabase {
     /// Canonical serialization of the resource_limits_state singleton: the net
     /// and cpu block-usage accumulators, then pending/total/virtual scalars.
     pub fn resource_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let s = match db.table::<ResourceStateRow>() {
             Ok(t) => match t.iter().next() {
                 Some(s) => *s,
@@ -2407,7 +2412,7 @@ impl ChainDatabase {
     /// (code, scope, table) order: code, scope, table, payer (u64 LE each),
     /// count (u32 LE). No genesis rows (contracts create tables at runtime).
     pub fn contract_table_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut rows: Vec<(u64, u64, u64, u64, u32)> = match db.table::<ContractTableRow>() {
             Ok(t) => t
                 .iter()
@@ -2433,7 +2438,7 @@ impl ChainDatabase {
     /// table, primary_key, payer (u64 LE each), then a length-prefixed value.
     pub fn contract_kv_state_bytes(&self) -> Vec<u8> {
         use std::collections::HashMap;
-        let db = self.lock();
+        let db = self.read();
         let table_key: HashMap<i64, (u64, u64, u64)> = match db.table::<ContractTableRow>() {
             Ok(t) => t
                 .iter()
@@ -2568,7 +2573,7 @@ impl ChainDatabase {
     /// `(account, code, message_type)`, or `None` when absent — for diffing
     /// against chainbase's `find_permission_link`.
     pub fn permission_link(&self, account: u64, code: u64, message_type: u64) -> Option<u64> {
-        self.lock()
+        self.read()
             .find_by::<PermissionLinkRow, LinkByActionName>(&(account, code, message_type))
             .ok()
             .flatten()
@@ -2579,7 +2584,7 @@ impl ChainDatabase {
     /// `by_permission_name` order, as `(required_permission, code, action)`.
     pub fn permission_links_of(&self, account: u64) -> Vec<(u64, u64, u64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         match db.table::<PermissionLinkRow>() {
             Ok(tbl) => tbl
                 .get_index::<LinkByPermissionName>()
@@ -2712,7 +2717,7 @@ impl ChainDatabase {
     /// pending row if one is staged, else the committed row — matching
     /// chainbase's `get_account_limits`.
     pub fn account_limits(&self, account: u64) -> Option<(i64, i64, i64)> {
-        let db = self.lock();
+        let db = self.read();
         if let Some(r) = db
             .find_by::<ResourceLimitsRow, LimitsByOwner>(&(1u8, account))
             .ok()
@@ -2745,7 +2750,7 @@ impl ChainDatabase {
         current_slot: Option<u32>,
     ) -> Option<(AccountResourceLimit, bool)> {
         let (_ram, net_weight, _cpu) = self.account_limits(account)?;
-        let db = self.lock();
+        let db = self.read();
         let state = db.table::<ResourceStateRow>().ok()?.iter().next()?;
         let cfg = db.table::<ResourceConfigRow>().ok()?.iter().next()?;
         let usage = db
@@ -2782,7 +2787,7 @@ impl ChainDatabase {
         current_slot: Option<u32>,
     ) -> Option<(AccountResourceLimit, bool)> {
         let (_ram, _net, cpu_weight) = self.account_limits(account)?;
-        let db = self.lock();
+        let db = self.read();
         let state = db.table::<ResourceStateRow>().ok()?.iter().next()?;
         let cfg = db.table::<ResourceConfigRow>().ok()?.iter().next()?;
         let usage = db
@@ -2930,7 +2935,7 @@ impl ChainDatabase {
     /// Mirrored `(virtual_cpu_limit, virtual_net_limit)`, or `None` if the state
     /// row is absent — for diffing against chainbase.
     pub fn state_virtual_limits(&self) -> Option<(u64, u64)> {
-        self.lock()
+        self.read()
             .table::<ResourceStateRow>()
             .ok()?
             .iter()
@@ -2942,7 +2947,7 @@ impl ChainDatabase {
     /// or `None` if the row is absent — serves `get_total_cpu_weight` /
     /// `get_total_net_weight` from the Rust database.
     pub fn state_total_weights(&self) -> Option<(u64, u64)> {
-        self.lock()
+        self.read()
             .table::<ResourceStateRow>()
             .ok()?
             .iter()
@@ -2955,7 +2960,7 @@ impl ChainDatabase {
     /// `get_block_cpu_limit` / `get_block_net_limit`. `None` if either singleton
     /// is absent.
     pub fn block_limits(&self) -> Option<(u64, u64)> {
-        let db = self.lock();
+        let db = self.read();
         let cfg = db.table::<ResourceConfigRow>().ok()?.iter().next()?;
         let state = db.table::<ResourceStateRow>().ok()?.iter().next()?;
         Some((
@@ -2969,7 +2974,7 @@ impl ChainDatabase {
     /// driven directly from the arena. `None` if the
     /// config row is absent.
     pub fn resource_config_elastic(&self) -> Option<(ElasticParams, ElasticParams)> {
-        self.lock()
+        self.read()
             .table::<ResourceConfigRow>()
             .ok()?
             .iter()
@@ -3001,7 +3006,7 @@ impl ChainDatabase {
     /// `get_account_cpu_usage_average_window`. `None` if the config
     /// row is absent.
     pub fn usage_average_windows(&self) -> Option<(u32, u32)> {
-        self.lock()
+        self.read()
             .table::<ResourceConfigRow>()
             .ok()?
             .iter()
@@ -3036,7 +3041,7 @@ impl ChainDatabase {
     /// Mirrored RAM usage for `owner`, or `None` if absent — for diffing against
     /// chainbase's `get_account_ram_usage`.
     pub fn account_ram_usage(&self, owner: u64) -> Option<u64> {
-        self.lock()
+        self.read()
             .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
             .ok()
             .flatten()
@@ -3084,7 +3089,7 @@ impl ChainDatabase {
     /// Mirrored net_usage `value_ex` (the pre-multiplied accumulator state) for
     /// `owner` — for exact diffing against chainbase.
     pub fn account_net_usage_value_ex(&self, owner: u64) -> Option<u64> {
-        self.lock()
+        self.read()
             .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
             .ok()
             .flatten()
@@ -3094,7 +3099,7 @@ impl ChainDatabase {
     /// Mirrored cpu_usage `value_ex` for `owner` — for exact diffing against
     /// chainbase.
     pub fn account_cpu_usage_value_ex(&self, owner: u64) -> Option<u64> {
-        self.lock()
+        self.read()
             .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
             .ok()
             .flatten()
@@ -3257,7 +3262,7 @@ impl ChainDatabase {
         vm_type: u8,
         vm_version: u8,
     ) -> Option<Vec<u8>> {
-        let db = self.lock();
+        let db = self.read();
         let code_ref = db
             .find_by::<CodeRow, CodeByHash>(&(code_hash, vm_type, vm_version))
             .ok()
@@ -3317,7 +3322,7 @@ impl ChainDatabase {
     /// Mirrored `global_action_sequence`, or `None` if the singleton row has not
     /// been written yet — for diffing against chainbase.
     pub fn global_action_sequence(&self) -> Option<u64> {
-        self.lock()
+        self.read()
             .table::<DynGlobalPropertyRow>()
             .ok()?
             .iter()
@@ -3370,7 +3375,7 @@ impl ChainDatabase {
     /// block params, tx net/cpu limits, delays, action depths) off the arena so
     /// execution needs no chainbase `global_property_object`.
     pub fn chain_config_params(&self) -> Option<ChainConfigParams> {
-        let db = self.lock();
+        let db = self.read();
         let r = db.table::<GlobalPropertyRow>().ok()?.iter().next()?;
         Some(ChainConfigParams {
             max_block_net_usage: r.max_block_net_usage,
@@ -3425,7 +3430,7 @@ impl ChainDatabase {
 
     /// Current proposed schedule as `(proposal block, packed schedule)`.
     pub fn proposed_schedule(&self) -> Option<(u32, Vec<u8>)> {
-        let db = self.lock();
+        let db = self.read();
         let row = db.table::<ProposedScheduleRow>().ok()?.iter().next()?;
         let packed = db
             .blob::<ProposedScheduleRow>(row.packed_schedule)
@@ -3452,7 +3457,7 @@ impl ChainDatabase {
     /// endian, `ChainConfigV0` order), or empty when the singleton has not been
     /// seeded — byte-compatible with the chainbase `global_property_state_bytes`.
     pub fn global_property_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         match db
             .table::<GlobalPropertyRow>()
             .ok()
@@ -3503,7 +3508,7 @@ impl ChainDatabase {
     /// producer. The order is consensus-visible in a protocol-feature header
     /// extension, so do not derive it from an unordered map.
     pub fn preactivated_protocol_features(&self) -> Vec<[u8; 32]> {
-        let db = self.lock();
+        let db = self.read();
         let mut rows: Vec<_> = db
             .table::<PreactivatedProtocolFeatureRow>()
             .map(|table| table.iter().copied().collect())
@@ -3595,7 +3600,7 @@ impl ChainDatabase {
 
     /// Canonical SHiP payload for the imported `protocol_state` singleton.
     pub fn protocol_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut rows: Vec<_> = match db.table::<ProtocolFeatureRow>() {
             Ok(table) => table.iter().copied().collect(),
             Err(_) => return vec![0, 0],
@@ -3613,7 +3618,7 @@ impl ChainDatabase {
     }
 
     pub fn protocol_feature_activated(&self, feature_digest: [u8; 32]) -> bool {
-        self.lock()
+        self.read()
             .table::<ProtocolFeatureRow>()
             .map(|table| table.iter().any(|row| row.feature_digest == feature_digest))
             .unwrap_or(false)
@@ -3695,7 +3700,7 @@ impl ChainDatabase {
     /// Canonical serialization of the stored `resource_limits_config`, or empty
     /// when unseeded — byte-compatible with the chainbase `resource_config_state_bytes`.
     pub fn resource_config_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let Some(r) = db
             .table::<ResourceConfigRow>()
             .ok()
@@ -3742,7 +3747,7 @@ impl ChainDatabase {
     /// Whether the database holds a dedupe row for `trx_id` — for diffing against
     /// chainbase's `is_known_unexpired_transaction`.
     pub fn transaction_exists(&self, trx_id: [u8; 32]) -> bool {
-        self.lock()
+        self.read()
             .find_by::<TransactionRow, TxByTrxId>(&trx_id)
             .ok()
             .flatten()
@@ -3804,7 +3809,7 @@ impl ChainDatabase {
     /// Number of pending deferred transactions. Startup uses this to refuse a
     /// migrated checkpoint until the controller has a complete execution path.
     pub fn deferred_transaction_count(&self) -> usize {
-        self.lock()
+        self.read()
             .table::<DeferredTransactionRow>()
             .map(|table| table.iter().count())
             .unwrap_or_default()
@@ -3814,7 +3819,7 @@ impl ChainDatabase {
     /// `(delay_until,id)` order. The controller must receive expired rows too:
     /// it retires them with an ID-only `expired` receipt.
     pub fn due_deferred_transactions(&self, now_micros: i64) -> Vec<DeferredTransaction> {
-        let db = self.lock();
+        let db = self.read();
         let mut rows: Vec<(i64, i64, DeferredTransaction)> =
             match db.table::<DeferredTransactionRow>() {
                 Ok(table) => table
@@ -3852,7 +3857,7 @@ impl ChainDatabase {
     /// this instead of trusting a producer-provided marker: the durable Arena
     /// record is the sole proof that a zero-signature transaction is scheduled.
     pub fn deferred_transaction(&self, trx_id: [u8; 32]) -> Option<DeferredTransaction> {
-        let db = self.lock();
+        let db = self.read();
         let row = db
             .find_by::<DeferredTransactionRow, DeferredByTrxId>(&trx_id)
             .ok()
@@ -3882,7 +3887,7 @@ impl ChainDatabase {
         sender: u64,
         sender_id: u128,
     ) -> Option<DeferredTransaction> {
-        let db = self.lock();
+        let db = self.read();
         let key = (sender, (sender_id >> 64) as u64, sender_id as u64);
         let row = db
             .find_by::<DeferredTransactionRow, DeferredBySenderId>(&key)
@@ -3939,7 +3944,7 @@ impl ChainDatabase {
     /// order. This is used at migration startup to validate the raw payloads
     /// before the node begins producing blocks.
     pub fn deferred_transactions(&self) -> Vec<DeferredTransaction> {
-        let db = self.lock();
+        let db = self.read();
         let mut rows: Vec<([u8; 32], DeferredTransaction)> =
             match db.table::<DeferredTransactionRow>() {
                 Ok(table) => table
@@ -4053,7 +4058,7 @@ impl ChainDatabase {
     /// stored value bytes, or `None` if the row is absent. This is the read the
     /// arena must answer identically to chainbase to run as primary.
     pub fn kv_get(&self, code: u64, scope: u64, table: u64, primary_key: u64) -> Option<Vec<u8>> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -4073,7 +4078,7 @@ impl ChainDatabase {
     /// standalone-writes db_store path bills table-creation RAM only on the first
     /// row, so it must decide table existence against the arena, not chainbase.
     pub fn table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
-        let db = self.lock();
+        let db = self.read();
         db.find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
             .flatten()
@@ -4086,7 +4091,7 @@ impl ChainDatabase {
     /// the creation payer — see the note on `ContractTableRow`: the database cannot
     /// observe chainbase reassigning it internally.
     pub fn table_payer(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
-        let db = self.lock();
+        let db = self.read();
         db.find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
             .flatten()
@@ -4103,7 +4108,7 @@ impl ChainDatabase {
         table: u64,
         primary_key: u64,
     ) -> Option<(u64, Vec<u8>)> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -4140,7 +4145,7 @@ impl ChainDatabase {
         table: u64,
     ) -> Vec<(u64, u64, Vec<u8>)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let Some(t_id) = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -4176,13 +4181,13 @@ impl ChainDatabase {
     /// from "row absent but table present" (an end iterator), matching the
     /// db_find/lowerbound/end semantics.
     pub fn kv_table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
-        let db = self.lock();
+        let db = self.read();
         self.resolve_t_id(&db, code, scope, table).is_some()
     }
 
     pub fn kv_lower_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractKeyValueRow>()
             .ok()?
@@ -4197,7 +4202,7 @@ impl ChainDatabase {
 
     pub fn kv_upper_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractKeyValueRow>()
             .ok()?
@@ -4212,7 +4217,7 @@ impl ChainDatabase {
 
     pub fn kv_prev(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractKeyValueRow>()
             .ok()?
@@ -4229,7 +4234,7 @@ impl ChainDatabase {
     /// where db_previous_i64 lands when stepping back from the end iterator.
     pub fn kv_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractKeyValueRow>()
             .ok()?
@@ -4256,7 +4261,7 @@ impl ChainDatabase {
         secondary: u64,
     ) -> Option<(u64, u64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractIndex64Row>()
             .ok()?
@@ -4277,7 +4282,7 @@ impl ChainDatabase {
         secondary: u64,
     ) -> Option<(u64, u64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractIndex64Row>()
             .ok()?
@@ -4312,7 +4317,7 @@ impl ChainDatabase {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.find_by::<ContractIndex64Row, ContractIdx64ByPrimary>(&(t_id, primary))
             .ok()
@@ -4331,7 +4336,7 @@ impl ChainDatabase {
         primary: u64,
     ) -> Option<(u64, u64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let sec = db
             .find_by::<ContractIndex64Row, ContractIdx64ByPrimary>(&(t_id, primary))
@@ -4360,7 +4365,7 @@ impl ChainDatabase {
         primary: u64,
     ) -> Option<(u64, u64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let sec = db
             .find_by::<ContractIndex64Row, ContractIdx64ByPrimary>(&(t_id, primary))
@@ -4382,7 +4387,7 @@ impl ChainDatabase {
     /// `(secondary, primary)` order, or `None` when the index is empty.
     pub fn idx64_last(&self, code: u64, scope: u64, table: u64) -> Option<(u64, u64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractIndex64Row>()
             .ok()?
@@ -4405,7 +4410,7 @@ impl ChainDatabase {
         table: u64,
     ) -> Vec<(u64, u64, u64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let Some(t_id) = self.resolve_t_id(&db, code, scope, table) else {
             return Vec::new();
         };
@@ -4432,7 +4437,7 @@ impl ChainDatabase {
         secondary: u128,
     ) -> Option<(u64, u128)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractIndex128Row>()
             .ok()?
@@ -4453,7 +4458,7 @@ impl ChainDatabase {
         secondary: u128,
     ) -> Option<(u64, u128)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractIndex128Row>()
             .ok()?
@@ -4485,7 +4490,7 @@ impl ChainDatabase {
         table: u64,
         primary: u64,
     ) -> Option<u128> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.find_by::<ContractIndex128Row, ContractIdx128ByPrimary>(&(t_id, primary))
             .ok()
@@ -4504,7 +4509,7 @@ impl ChainDatabase {
     ) -> Option<(u64, [u8; 32])> {
         use std::ops::Bound;
         let (w0, w1) = split_key256(&secondary);
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractIndex256Row>()
             .ok()?
@@ -4526,7 +4531,7 @@ impl ChainDatabase {
     ) -> Option<(u64, [u8; 32])> {
         use std::ops::Bound;
         let (w0, w1) = split_key256(&secondary);
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractIndex256Row>()
             .ok()?
@@ -4558,7 +4563,7 @@ impl ChainDatabase {
         table: u64,
         primary: u64,
     ) -> Option<[u8; 32]> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.find_by::<ContractIndex256Row, ContractIdx256ByPrimary>(&(t_id, primary))
             .ok()
@@ -4579,7 +4584,7 @@ impl ChainDatabase {
         secondary: f64,
     ) -> Option<(u64, f64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
             .table::<ContractIndexDoubleRow>()
@@ -4604,7 +4609,7 @@ impl ChainDatabase {
         secondary: f64,
     ) -> Option<(u64, f64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
             .table::<ContractIndexDoubleRow>()
@@ -4640,7 +4645,7 @@ impl ChainDatabase {
         table: u64,
         primary: u64,
     ) -> Option<f64> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.find_by::<ContractIndexDoubleRow, ContractIdxDoubleByPrimary>(&(t_id, primary))
             .ok()
@@ -4663,7 +4668,7 @@ impl ChainDatabase {
             lo: secondary.0,
             hi: secondary.1,
         };
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
             .table::<ContractIndexLongDoubleRow>()
@@ -4689,7 +4694,7 @@ impl ChainDatabase {
             lo: secondary.0,
             hi: secondary.1,
         };
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
             .table::<ContractIndexLongDoubleRow>()
@@ -4726,7 +4731,7 @@ impl ChainDatabase {
         table: u64,
         primary: u64,
     ) -> Option<(u64, u64)> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.find_by::<ContractIndexLongDoubleRow, ContractIdxLongDoubleByPrimary>(&(t_id, primary))
             .ok()
@@ -4743,7 +4748,7 @@ impl ChainDatabase {
 
     pub fn idx128_next(&self, code: u64, scope: u64, table: u64, primary: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let sec = db
             .find_by::<ContractIndex128Row, ContractIdx128ByPrimary>(&(t_id, primary))
@@ -4764,7 +4769,7 @@ impl ChainDatabase {
 
     pub fn idx128_previous(&self, code: u64, scope: u64, table: u64, primary: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let sec = db
             .find_by::<ContractIndex128Row, ContractIdx128ByPrimary>(&(t_id, primary))
@@ -4785,7 +4790,7 @@ impl ChainDatabase {
 
     pub fn idx128_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
             .table::<ContractIndex128Row>()
@@ -4804,7 +4809,7 @@ impl ChainDatabase {
 
     pub fn idx256_next(&self, code: u64, scope: u64, table: u64, primary: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let (w0, w1) = db
             .find_by::<ContractIndex256Row, ContractIdx256ByPrimary>(&(t_id, primary))
@@ -4825,7 +4830,7 @@ impl ChainDatabase {
 
     pub fn idx256_previous(&self, code: u64, scope: u64, table: u64, primary: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let (w0, w1) = db
             .find_by::<ContractIndex256Row, ContractIdx256ByPrimary>(&(t_id, primary))
@@ -4846,7 +4851,7 @@ impl ChainDatabase {
 
     pub fn idx256_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
             .table::<ContractIndex256Row>()
@@ -4865,7 +4870,7 @@ impl ChainDatabase {
 
     pub fn idx_double_next(&self, code: u64, scope: u64, table: u64, primary: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let sec = db
             .find_by::<ContractIndexDoubleRow, ContractIdxDoubleByPrimary>(&(t_id, primary))
@@ -4895,7 +4900,7 @@ impl ChainDatabase {
         primary: u64,
     ) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let sec = db
             .find_by::<ContractIndexDoubleRow, ContractIdxDoubleByPrimary>(&(t_id, primary))
@@ -4919,7 +4924,7 @@ impl ChainDatabase {
 
     pub fn idx_double_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
             .table::<ContractIndexDoubleRow>()
@@ -4944,7 +4949,7 @@ impl ChainDatabase {
         primary: u64,
     ) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let (lo, hi) = db
             .find_by::<ContractIndexLongDoubleRow, ContractIdxLongDoubleByPrimary>(&(t_id, primary))
@@ -4974,7 +4979,7 @@ impl ChainDatabase {
         primary: u64,
     ) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let (lo, hi) = db
             .find_by::<ContractIndexLongDoubleRow, ContractIdxLongDoubleByPrimary>(&(t_id, primary))
@@ -4998,7 +5003,7 @@ impl ChainDatabase {
 
     pub fn idx_long_double_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         // +inf is the largest ordering key over valid (non-NaN) stored secondaries.
         let max_key = LongDoubleKey {
@@ -5503,7 +5508,7 @@ impl ChainDatabase {
 
     /// The payer of an idx64 row, or `None` if absent.
     pub fn idx64_payer(&self, code: u64, scope: u64, table: u64, primary_key: u64) -> Option<u64> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -5517,7 +5522,7 @@ impl ChainDatabase {
 
     /// The payer of an idx128 row, or `None` if absent.
     pub fn idx128_payer(&self, code: u64, scope: u64, table: u64, primary_key: u64) -> Option<u64> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -5531,7 +5536,7 @@ impl ChainDatabase {
 
     /// The payer of an idx256 row, or `None` if absent.
     pub fn idx256_payer(&self, code: u64, scope: u64, table: u64, primary_key: u64) -> Option<u64> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -5551,7 +5556,7 @@ impl ChainDatabase {
         table: u64,
         primary_key: u64,
     ) -> Option<u64> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -5571,7 +5576,7 @@ impl ChainDatabase {
         table: u64,
         primary_key: u64,
     ) -> Option<u64> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -5609,6 +5614,28 @@ fn join_key256(w0: u128, w1: u128) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn frozen_contract_rows_are_safe_for_concurrent_readers() {
+        assert_send_sync::<ChainDatabase>();
+
+        let database = ChainDatabase::new().unwrap();
+        database
+            .create_key_value_object(1, 2, 3, 4, 5, b"parallel")
+            .unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let reader = database.clone();
+                scope.spawn(move || {
+                    for _ in 0..1_000 {
+                        assert_eq!(reader.kv_get(1, 2, 3, 5).as_deref(), Some(&b"parallel"[..]));
+                    }
+                });
+            }
+        });
+    }
 
     /// The read primitives the arena serves to a contract — point read, forward
     /// scan, and the four iterator-positioning queries — must follow the index's

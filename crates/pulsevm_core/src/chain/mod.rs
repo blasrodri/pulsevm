@@ -22,6 +22,7 @@ pub mod transaction_context;
 pub mod utils;
 pub mod wasm_runtime;
 mod webassembly;
+mod xpr_native_replay;
 
 // Re-export types for easier access
 pub mod name {

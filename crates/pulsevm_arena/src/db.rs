@@ -98,7 +98,7 @@ fn append_frame(path: &Path, frame: &[u8]) -> Result<(), DbError> {
 
 /// Type-erased view of a `Table<T>` so the database can drive the shared
 /// revision/undo lifecycle across a heterogeneous set of tables.
-trait AbstractTable: Send {
+trait AbstractTable: Send + Sync {
     fn start_undo_session(&mut self) -> i64;
     fn revision(&self) -> i64;
     fn set_revision(&mut self, revision: i64) -> Result<(), TableError>;

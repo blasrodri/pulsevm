@@ -287,7 +287,11 @@ impl ApplyContext {
         let forward_setcode = self
             .db
             .protocol_feature_activated(FORWARD_SETCODE_FEATURE_DIGEST);
-        if code_hash != [0u8; 32] && (!is_system_setcode || forward_setcode) {
+        let xpr_native_cpu = super::xpr_native_replay::try_apply(self, &action, &code_hash)?;
+        if let Some(native_cpu) = xpr_native_cpu {
+            cpu_used += native_cpu;
+            self.trx_context.checktime()?;
+        } else if code_hash != [0u8; 32] && (!is_system_setcode || forward_setcode) {
             // Separate context here because we need to release the lock on inner before executing
             // the Wasm code, which may call back into the context and cause deadlock if we hold the
             // lock.
@@ -2717,6 +2721,18 @@ impl ApplyContext {
 
     pub fn pending_block_timestamp(&self) -> &BlockTimestamp {
         &self.pending_block_timestamp
+    }
+
+    pub(crate) fn receiver(&self) -> Name {
+        self.receiver
+    }
+
+    pub(crate) fn is_explicitly_billed(&self) -> Result<bool, ChainError> {
+        self.trx_context.is_explicitly_billed()
+    }
+
+    pub(crate) fn xpr_native_replay_enabled(&self) -> bool {
+        self.db.xpr_native_replay_enabled()
     }
 
     /// Validated consensus context for the block applying this action.

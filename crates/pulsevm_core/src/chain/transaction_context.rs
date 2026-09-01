@@ -950,6 +950,13 @@ impl TransactionContext {
         ))
     }
 
+    /// Whether this transaction is replaying a producer-recorded receipt.
+    /// Migration-only native accelerators use this to remain unreachable from
+    /// normal mempool execution, where local WASM metering is authoritative.
+    pub(crate) fn is_explicitly_billed(&self) -> Result<bool, ChainError> {
+        Ok(self.inner.read()?.explicit_billed_cpu_time)
+    }
+
     fn execution_cpu_limit(explicit_billed: bool, objective_limit: i64) -> i64 {
         if explicit_billed { -1 } else { objective_limit }
     }

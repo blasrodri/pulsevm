@@ -111,7 +111,7 @@ pub struct BlobRef {
 /// The engine core keeps `T` as an ordinary owned value in the arena; the POD
 /// layout required for mmap persistence is layered on later.
 pub trait ArenaObject:
-    Copy + Default + Send + FromBytes + IntoBytes + Immutable + KnownLayout + 'static
+    Copy + Default + Send + Sync + FromBytes + IntoBytes + Immutable + KnownLayout + 'static
 {
     /// Unique per-database table number (chainbase `object::type_id`).
     const TYPE_ID: u16;
@@ -133,15 +133,15 @@ pub trait ArenaObject:
 /// `boost::multi_index::ordered_unique<tag<Tag>, key<...>>` entry. Implement it
 /// on an empty tag type and return the index from
 /// [`ArenaObject::secondary_indices`] via [`key_index`].
-pub trait IndexedBy<T: ArenaObject>: 'static {
-    type Key: Ord + Clone + Send + 'static;
+pub trait IndexedBy<T: ArenaObject>: Send + Sync + 'static {
+    type Key: Ord + Clone + Send + Sync + 'static;
 
     fn key(obj: &T) -> Self::Key;
 }
 
 /// Object-safe interface used by [`Table`] to maintain a secondary index
 /// without knowing its key type.
-pub trait SecondaryIndex<T: ArenaObject>: Send {
+pub trait SecondaryIndex<T: ArenaObject>: Send + Sync {
     fn tag(&self) -> TypeId;
     fn index_name(&self) -> &'static str;
     /// Inserts the object's key -> id in a single tree operation; returns

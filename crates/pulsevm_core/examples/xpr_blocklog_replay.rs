@@ -36,6 +36,8 @@ use pulsevm_core::{
     controller::{
         AuthenticatedMigrationBlock,
         Controller,
+        MigrationBlockAuthenticator,
+        PreparedMigrationBlock,
     },
     id::Id,
     mempool::Mempool,
@@ -51,6 +53,7 @@ const XPR_V3_FIRST_BLOCK_OFFSET: u64 = 126;
 const PARTIAL_SCAN_WINDOW: usize = 4 * 1024 * 1024;
 const SIGNATURE_BATCH_SIZE: usize = 256;
 const SIGNATURE_PIPELINE_BATCHES: usize = 4;
+const MAX_DEFAULT_SIGNATURE_THREADS: usize = 8;
 const ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST: [u8; 32] = [
     0x1a, 0x99, 0xa5, 0x9d, 0x87, 0xe0, 0x6e, 0x09, 0xec, 0x5b, 0x02, 0x8a, 0x9c, 0xbb, 0x77, 0x49,
     0xb4, 0xa5, 0xad, 0x88, 0x19, 0x00, 0x43, 0x65, 0xd0, 0x2d, 0xc4, 0x37, 0x9a, 0x8b, 0x72, 0x41,
@@ -374,6 +377,43 @@ fn block_mentions_account(block: &SignedBlock, account: Name) -> bool {
     })
 }
 
+fn authenticate_signature_batch(
+    batch: Vec<PreparedMigrationBlock>,
+    thread_count: usize,
+) -> Result<Vec<AuthenticatedMigrationBlock>> {
+    let worker_count = thread_count.min(batch.len()).max(1);
+    let chunk_size = batch.len().div_ceil(worker_count);
+    let mut batch = batch.into_iter();
+    let chunks: Vec<Vec<_>> = (0..worker_count)
+        .map(|_| batch.by_ref().take(chunk_size).collect())
+        .filter(|chunk: &Vec<_>| !chunk.is_empty())
+        .collect();
+
+    thread::scope(|scope| {
+        let workers: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .into_iter()
+                        .map(MigrationBlockAuthenticator::authenticate_prepared)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut authenticated = Vec::with_capacity(SIGNATURE_BATCH_SIZE);
+        for worker in workers {
+            let recovered = worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("signature recovery worker panicked"))?;
+            for block in recovered {
+                authenticated.push(block?);
+            }
+        }
+        Ok(authenticated)
+    })
+}
+
 fn usage(program: &str) {
     eprintln!(
         "Usage: {program} <source-blocks-dir> <arena-dir> [last-block]\n\
@@ -422,6 +462,23 @@ async fn main() -> Result<()> {
     if checkpoint_interval == 0 {
         bail!("XPR_REPLAY_CHECKPOINT_INTERVAL must be greater than zero");
     }
+    let signature_threads = env::var("XPR_REPLAY_SIGNATURE_THREADS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .context("XPR_REPLAY_SIGNATURE_THREADS must be a positive integer")
+        })
+        .transpose()?
+        .unwrap_or_else(|| {
+            thread::available_parallelism()
+                .map(|count| count.get().saturating_sub(1))
+                .unwrap_or(1)
+                .clamp(1, MAX_DEFAULT_SIGNATURE_THREADS)
+        });
+    if signature_threads == 0 {
+        bail!("XPR_REPLAY_SIGNATURE_THREADS must be greater than zero");
+    }
 
     let source_dir = PathBuf::from(source_dir);
     let arena_dir = PathBuf::from(arena_dir);
@@ -430,6 +487,33 @@ async fn main() -> Result<()> {
     let last = requested_last.unwrap_or(source_last).min(source_last);
     if last < 1 {
         bail!("source block log has no genesis block");
+    }
+
+    // Decode packed source blocks without constructing a controller or scanning
+    // its accepted history. This keeps workload inspection cheap enough to use
+    // while profiling a long replay checkpoint.
+    if env::var_os("XPR_REPLAY_DECODE_ONLY").is_some() {
+        let final_block = debug_block
+            .context("XPR_REPLAY_DECODE_ONLY requires XPR_REPLAY_DEBUG_BLOCK=<height>")?;
+        let first_block = env::var("XPR_REPLAY_INSPECT_FROM")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .context("XPR_REPLAY_INSPECT_FROM must be a uint32")
+            })
+            .transpose()?
+            .unwrap_or(final_block);
+        if first_block > final_block || final_block > source_last {
+            bail!("requested decode range is outside the source block log");
+        }
+        for block_num in first_block..=final_block {
+            let packed = source.packed_block(block_num)?;
+            let block = SignedBlock::read(&packed, &mut 0)
+                .map_err(|error| anyhow::anyhow!("decode source block {block_num}: {error}"))?;
+            dump_block(block_num, &block);
+        }
+        return Ok(());
     }
 
     let chain_id = Id::from_str(XPR_CHAIN_ID).expect("constant XPR chain id is valid");
@@ -460,6 +544,9 @@ async fn main() -> Result<()> {
             .to_str()
             .context("arena directory is not valid UTF-8")?,
     )?;
+    if env::var_os("PULSEVM_XPR_NATIVE_REPLAY").is_some() {
+        controller.database().enable_xpr_native_replay();
+    }
     let local_tip = controller.last_accepted_block();
     if local_tip.block_num() == 1 && local_tip.id()?.to_string() != XPR_BLOCK_ONE_ID {
         bail!(
@@ -581,19 +668,21 @@ async fn main() -> Result<()> {
                             block.block_num()
                         );
                     }
-                    let authenticated = authenticator.authenticate(block).with_context(|| {
-                        format!("authenticate canonical source block {block_num}")
-                    })?;
-                    batch.push(authenticated);
+                    let prepared = authenticator
+                        .prepare(block)
+                        .with_context(|| format!("prepare canonical source block {block_num}"))?;
+                    batch.push(prepared);
                     if batch.len() == SIGNATURE_BATCH_SIZE {
-                        if signature_sender.send(Ok(batch)).is_err() {
+                        let authenticated = authenticate_signature_batch(batch, signature_threads)?;
+                        if signature_sender.send(Ok(authenticated)).is_err() {
                             return Ok(());
                         }
                         batch = Vec::with_capacity(SIGNATURE_BATCH_SIZE);
                     }
                 }
                 if !batch.is_empty() {
-                    let _ = signature_sender.send(Ok(batch));
+                    let authenticated = authenticate_signature_batch(batch, signature_threads)?;
+                    let _ = signature_sender.send(Ok(authenticated));
                 }
                 Ok(())
             })();

@@ -11,6 +11,8 @@ readonly TARGET_DIR="${XPR_REPLAY_TARGET_DIR:-$REPO_ROOT/target/xpr-replay-nativ
 readonly BINARY="$TARGET_DIR/release/examples/xpr_blocklog_replay"
 readonly SERVICE="${XPR_REPLAY_SERVICE:-pulsevm-xpr-mainnet-replay}.service"
 readonly CHECKPOINT_INTERVAL="${XPR_REPLAY_CHECKPOINT_INTERVAL:-1000000}"
+readonly SIGNATURE_THREADS="${XPR_REPLAY_SIGNATURE_THREADS:-8}"
+readonly NATIVE_REPLAY="${XPR_REPLAY_NATIVE_REPLAY:-1}"
 readonly LAST_BLOCK="${XPR_REPLAY_LAST_BLOCK:-}"
 
 fail() {
@@ -51,6 +53,9 @@ build_replay() {
 start_replay() {
   require_linux
   validate_uint "$CHECKPOINT_INTERVAL" XPR_REPLAY_CHECKPOINT_INTERVAL
+  validate_uint "$SIGNATURE_THREADS" XPR_REPLAY_SIGNATURE_THREADS
+  [[ "$NATIVE_REPLAY" == 0 || "$NATIVE_REPLAY" == 1 ]] || \
+    fail "XPR_REPLAY_NATIVE_REPLAY must be 0 or 1"
   [[ -z "$LAST_BLOCK" ]] || validate_uint "$LAST_BLOCK" XPR_REPLAY_LAST_BLOCK
   [[ -x "$BINARY" ]] || fail "replay binary is missing; run '$0 build' first"
   [[ -s "$SOURCE_DIR/blocks.log" ]] || fail "missing $SOURCE_DIR/blocks.log"
@@ -71,8 +76,12 @@ start_replay() {
 
   local command=(
     env "XPR_REPLAY_CHECKPOINT_INTERVAL=$CHECKPOINT_INTERVAL"
-    "$BINARY" "$SOURCE_DIR" "$ARENA_DIR"
+    "XPR_REPLAY_SIGNATURE_THREADS=$SIGNATURE_THREADS"
   )
+  if [[ "$NATIVE_REPLAY" == 1 ]]; then
+    command+=("PULSEVM_XPR_NATIVE_REPLAY=1")
+  fi
+  command+=("$BINARY" "$SOURCE_DIR" "$ARENA_DIR")
   [[ -z "$LAST_BLOCK" ]] || command+=("$LAST_BLOCK")
 
   # Retry only abnormal process death. A normal non-zero exit is a parity error
@@ -125,6 +134,8 @@ Environment:
   XPR_REPLAY_SERVICE             systemd user service name without .service
   XPR_REPLAY_LAST_BLOCK          Optional pinned terminal block
   XPR_REPLAY_CHECKPOINT_INTERVAL Durable checkpoint interval (default: 1000000)
+  XPR_REPLAY_SIGNATURE_THREADS   Header signature workers (default: 8)
+  XPR_REPLAY_NATIVE_REPLAY       Enable audited native XPR handlers: 0 or 1 (default: 1)
 EOF
 }
 

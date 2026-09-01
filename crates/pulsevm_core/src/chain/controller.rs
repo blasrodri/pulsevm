@@ -319,6 +319,17 @@ pub struct AuthenticatedMigrationBlock {
     signer: PublicKey,
 }
 
+/// Header proof prepared in canonical order but not yet subjected to expensive
+/// public-key recovery. Its private fields bind the digest and expected key to
+/// the exact block while allowing recovery to run on a worker pool.
+#[doc(hidden)]
+pub struct PreparedMigrationBlock {
+    block: SignedBlock,
+    digest: Digest,
+    expected: PublicKey,
+    schedule_version: u32,
+}
+
 impl AuthenticatedMigrationBlock {
     pub fn block(&self) -> &SignedBlock {
         &self.block
@@ -397,10 +408,7 @@ impl HeaderSigningState {
 }
 
 impl MigrationBlockAuthenticator {
-    pub fn authenticate(
-        &mut self,
-        block: SignedBlock,
-    ) -> Result<AuthenticatedMigrationBlock, ChainError> {
+    pub fn prepare(&mut self, block: SignedBlock) -> Result<PreparedMigrationBlock, ChainError> {
         if *block.previous_id() != self.previous_id {
             return Err(ChainError::BlockError(format!(
                 "migration signature stream expected parent {}, found {} for block {}",
@@ -422,26 +430,50 @@ impl MigrationBlockAuthenticator {
                     header.producer
                 ))
             })?;
+        let expected = *expected;
         let digest = if self.antelope_block_signatures {
             self.signing_state.signing_digest(header)?
         } else {
             header.sig_digest()?
         };
-        let signer = block
-            .signed_block_header
-            .signature
-            .recover_public_key(&digest)?;
-        if &signer != expected {
-            return Err(ChainError::BlockError(format!(
-                "block signature recovered {signer}, expected {expected} for producer {} in schedule version {}",
-                header.producer, self.schedule_state.active.version
-            )));
-        }
-
         let block_id = block.id()?;
         self.signing_state.accept(&block)?;
         self.previous_id = block_id;
-        Ok(AuthenticatedMigrationBlock { block, signer })
+        Ok(PreparedMigrationBlock {
+            block,
+            digest,
+            expected,
+            schedule_version: self.schedule_state.active.version,
+        })
+    }
+
+    pub fn authenticate_prepared(
+        prepared: PreparedMigrationBlock,
+    ) -> Result<AuthenticatedMigrationBlock, ChainError> {
+        let signer = prepared
+            .block
+            .signed_block_header
+            .signature
+            .recover_public_key(&prepared.digest)?;
+        if signer != prepared.expected {
+            return Err(ChainError::BlockError(format!(
+                "block signature recovered {signer}, expected {} for producer {} in schedule version {}",
+                prepared.expected,
+                prepared.block.signed_block_header.header.producer,
+                prepared.schedule_version
+            )));
+        }
+        Ok(AuthenticatedMigrationBlock {
+            block: prepared.block,
+            signer,
+        })
+    }
+
+    pub fn authenticate(
+        &mut self,
+        block: SignedBlock,
+    ) -> Result<AuthenticatedMigrationBlock, ChainError> {
+        Self::authenticate_prepared(self.prepare(block)?)
     }
 }
 
@@ -3191,8 +3223,18 @@ impl Controller {
 
         if let Some(tracker) = dependency_tracker {
             let report = tracker.snapshot();
-            debug!(
-                "dependency telemetry trx={} success={} complete={} exact_reads={} range_reads={} writes={} read_keys={:?} ranges={:?} write_keys={:?}",
+            let block_num = execution.as_ref().map_or_else(
+                |_| self.last_accepted_block().block_num() + 1,
+                |result| result.trace.block_num,
+            );
+            // Telemetry is explicitly opt-in and is commonly collected from
+            // release replay binaries, whose default log level hides debug
+            // records. Emit the requested report at info so operators do not
+            // need to weaken the global log filter (and flood the replay with
+            // unrelated debug output) to measure conflict rates.
+            info!(
+                "dependency telemetry block={} trx={} success={} complete={} exact_reads={} range_reads={} writes={} read_keys={:?} ranges={:?} write_keys={:?}",
+                block_num,
                 packed_transaction.id(),
                 execution.is_ok(),
                 report.is_complete(),
