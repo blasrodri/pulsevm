@@ -2410,6 +2410,12 @@ impl Database {
         s.initialize_resource_state(2_000_000, 1_048_576)
             .map_err(|e| ChainError::InternalError(format!("genesis resource_state: {e:?}")))?;
 
+        // authorization_manager::initialize_database reserves permission id 0
+        // as a default sentinel before any native-account permissions exist.
+        // It consumes no RAM and deliberately does not allocate a usage row.
+        s.reserve_permission_zero()
+            .map_err(|e| ChainError::InternalError(format!("genesis permission zero: {e:?}")))?;
+
         // 4. native accounts. system_auth carries the genesis key; the producers' active authority
         //    delegates to the configured system account's active permission.
         let key_bytes = genesis.initial_key_packed().to_vec();
@@ -2884,6 +2890,19 @@ impl Database {
         last_updated: i64,
         authority: &[u8],
     ) -> Result<i64, ChainError> {
+        if owner == 0 && name == 0 {
+            // The SHiP decoder expands the default shared_authority into four
+            // zero u32 fields: threshold and the three container counts.
+            if parent != 0 || last_updated != 0 || authority != [0; 16] {
+                return Err(ChainError::InternalError(
+                    "XPR reserved permission zero has non-default fields".into(),
+                ));
+            }
+            self.backend.reserve_permission_zero().map_err(|e| {
+                ChainError::InternalError(format!("XPR import permission zero: {e:?}"))
+            })?;
+            return Ok(0);
+        }
         let id = self.backend.next_permission_id().map_err(|e| {
             ChainError::InternalError(format!("XPR import next permission id: {e:?}"))
         })?;
@@ -5494,6 +5513,25 @@ mod tests {
                 .unwrap();
         db.initialize_database(&genesis).unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn genesis_reserves_chainbase_permission_zero() {
+        let (_dir, db) = initialized_resource_db();
+        // The reserved row deliberately has an empty authority, so the normal
+        // permission accessor (which decodes an authority threshold) does not
+        // expose it. Its chainbase id is nevertheless present and serialized.
+        assert_eq!(db.backend.permission_cb_id(0, 0), Some(0));
+        assert_eq!(
+            db.backend
+                .permission_cb_id(name_u64("pulse"), name_u64("owner")),
+            Some(1)
+        );
+        assert_eq!(
+            db.backend
+                .permission_cb_id(name_u64("pulse"), name_u64("active")),
+            Some(2)
+        );
     }
 
     #[test]

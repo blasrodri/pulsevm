@@ -1881,6 +1881,21 @@ impl ChainDatabase {
 
     // ----- permission_object / permission_usage_object ----------------------
 
+    /// Reserve chainbase permission id 0. Leap creates this default object
+    /// without a permission-usage row before authoring the native accounts;
+    /// the first real permission then creates usage id 0, which the reserved
+    /// object intentionally aliases.
+    pub fn reserve_permission_zero(&self) -> Result<(), DbError> {
+        let mut db = self.lock();
+        if db.find_by::<PermissionRow, PermByOwner>(&(0, 0))?.is_none() {
+            db.create::<PermissionRow>(|permission| {
+                permission.cb_id = 0;
+                permission.usage_id = 0;
+            })?;
+        }
+        Ok(())
+    }
+
     /// Mirrors `create_permission`, which also creates the linked
     /// `permission_usage_object`. The usage row is created first so its id can be
     /// stored on the permission, exactly as the C++ path does.
@@ -2159,6 +2174,13 @@ impl ChainDatabase {
                 .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
                 .is_some()
             {
+                continue;
+            }
+            if cb_id == 0 && owner == 0 && perm_name == 0 {
+                db.create::<PermissionRow>(|permission| {
+                    permission.cb_id = 0;
+                    permission.usage_id = 0;
+                })?;
                 continue;
             }
             let usage_id = db
@@ -2514,6 +2536,13 @@ impl ChainDatabase {
         perm_name: u64,
         last_used_us: i64,
     ) -> Result<(), DbError> {
+        // The reserved permission has no permission_usage_object of its own.
+        // Its default usage id happens to alias the first real usage row, so
+        // applying the exporter sidecar value here would make import results
+        // depend on sidecar row ordering.
+        if owner == 0 && perm_name == 0 {
+            return Ok(());
+        }
         let mut db = self.lock();
         let usage_id = db
             .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?

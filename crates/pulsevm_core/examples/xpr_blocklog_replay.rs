@@ -54,12 +54,10 @@ const PARTIAL_SCAN_WINDOW: usize = 4 * 1024 * 1024;
 const SIGNATURE_BATCH_SIZE: usize = 256;
 const SIGNATURE_PIPELINE_BATCHES: usize = 4;
 const MAX_DEFAULT_SIGNATURE_THREADS: usize = 8;
-const REPLAY_SEMANTICS_VERSION: u32 = 2;
-// Block 1,205 creates XPR's first contract secondary index. Version 1 and
-// unmarked checkpoints after block 1,204 can underbill every secondary row by
-// one chainbase index overhead (32 bytes). They can also retain the generated
-// transaction retired at block 18,320,857, so neither class is safe to resume.
-const LAST_UNMARKED_SAFE_BLOCK: u32 = 1_204;
+const REPLAY_SEMANTICS_VERSION: u32 = 3;
+// Version 3 adds chainbase's reserved permission id 0 at genesis. Every older
+// persisted checkpoint is therefore unsafe to resume, even before block 1,205
+// (where version 1 also began underbilling secondary indices).
 const REPLAY_SEMANTICS_FILE: &str = "xpr_replay_semantics_version";
 const ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST: [u8; 32] = [
     0x1a, 0x99, 0xa5, 0x9d, 0x87, 0xe0, 0x6e, 0x09, 0xec, 0x5b, 0x02, 0x8a, 0x9c, 0xbb, 0x77, 0x49,
@@ -87,7 +85,11 @@ enum BlockOffsets {
     Scanned(Vec<u64>),
 }
 
-fn verify_replay_checkpoint_semantics(arena_dir: &Path, revision: u32) -> Result<()> {
+fn verify_replay_checkpoint_semantics(
+    arena_dir: &Path,
+    revision: u32,
+    initialized_fresh: bool,
+) -> Result<()> {
     let path = arena_dir.join(REPLAY_SEMANTICS_FILE);
     match fs::read_to_string(&path) {
         Ok(value) => {
@@ -103,9 +105,9 @@ fn verify_replay_checkpoint_semantics(arena_dir: &Path, revision: u32) -> Result
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let trusted = env::var("XPR_REPLAY_TRUST_LEGACY_CHECKPOINT").as_deref() == Ok("1");
-            if revision > LAST_UNMARKED_SAFE_BLOCK && !trusted {
+            if revision > 0 && !initialized_fresh && !trusted {
                 bail!(
-                    "unmarked Arena checkpoint at block {revision} may contain RAM state produced before secondary-index billing and deferred-transaction retirement were fixed; restart at or before block {LAST_UNMARKED_SAFE_BLOCK}, or set XPR_REPLAY_TRUST_LEGACY_CHECKPOINT=1 only after independent state validation"
+                    "unmarked Arena checkpoint at block {revision} may omit reserved permission id 0 or contain state produced before secondary-index billing and deferred-transaction retirement were fixed; restart from an empty Arena, or set XPR_REPLAY_TRUST_LEGACY_CHECKPOINT=1 only after independent state validation"
                 );
             }
             fs::write(&path, format!("{REPLAY_SEMANTICS_VERSION}\n"))
@@ -576,6 +578,7 @@ async fn main() -> Result<()> {
     }))?;
     let genesis =
         include_bytes!("../../../tools/xpr-chainbase-export/xpr-mainnet-genesis.json").to_vec();
+    let initialized_fresh = !arena_dir.join("arena_state.bin").exists();
     fs::create_dir_all(&arena_dir)?;
 
     let mut controller = Controller::new();
@@ -591,7 +594,7 @@ async fn main() -> Result<()> {
         controller.database().enable_xpr_native_replay();
     }
     let local_tip = controller.last_accepted_block();
-    verify_replay_checkpoint_semantics(&arena_dir, local_tip.block_num())?;
+    verify_replay_checkpoint_semantics(&arena_dir, local_tip.block_num(), initialized_fresh)?;
     if local_tip.block_num() == 1 && local_tip.id()?.to_string() != XPR_BLOCK_ONE_ID {
         bail!(
             "authored genesis id {} is not canonical XPR block 1",
@@ -821,9 +824,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn marks_an_unversioned_checkpoint_before_the_first_secondary_index() {
+    fn marks_a_fresh_arena() {
         let temp = tempfile::tempdir().unwrap();
-        verify_replay_checkpoint_semantics(temp.path(), LAST_UNMARKED_SAFE_BLOCK).unwrap();
+        verify_replay_checkpoint_semantics(temp.path(), 1, true).unwrap();
         assert_eq!(
             fs::read_to_string(temp.path().join(REPLAY_SEMANTICS_FILE)).unwrap(),
             format!("{REPLAY_SEMANTICS_VERSION}\n")
@@ -831,21 +834,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_unversioned_checkpoint_after_the_first_secondary_index() {
+    fn rejects_any_unversioned_persisted_checkpoint() {
         let temp = tempfile::tempdir().unwrap();
-        let error = verify_replay_checkpoint_semantics(
-            temp.path(),
-            LAST_UNMARKED_SAFE_BLOCK.saturating_add(1),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("may contain RAM state"));
+        let error = verify_replay_checkpoint_semantics(temp.path(), 1, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("may omit reserved permission id 0")
+        );
     }
 
     #[test]
     fn rejects_a_checkpoint_from_another_semantics_version() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join(REPLAY_SEMANTICS_FILE), "0\n").unwrap();
-        let error = verify_replay_checkpoint_semantics(temp.path(), 1).unwrap_err();
-        assert!(error.to_string().contains("requires 2"));
+        let error = verify_replay_checkpoint_semantics(temp.path(), 1, false).unwrap_err();
+        assert!(error.to_string().contains("requires 3"));
     }
 }
