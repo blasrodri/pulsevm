@@ -14,6 +14,8 @@ readonly CHECKPOINT_INTERVAL="${XPR_REPLAY_CHECKPOINT_INTERVAL:-1000000}"
 readonly SIGNATURE_THREADS="${XPR_REPLAY_SIGNATURE_THREADS:-8}"
 readonly NATIVE_REPLAY="${XPR_REPLAY_NATIVE_REPLAY:-1}"
 readonly LAST_BLOCK="${XPR_REPLAY_LAST_BLOCK:-}"
+readonly TRACE_RAM_ACCOUNT="${XPR_REPLAY_TRACE_RAM_ACCOUNT:-}"
+readonly TRUST_LEGACY_CHECKPOINT="${XPR_REPLAY_TRUST_LEGACY_CHECKPOINT:-0}"
 
 fail() {
   echo "error: $*" >&2
@@ -56,6 +58,8 @@ start_replay() {
   validate_uint "$SIGNATURE_THREADS" XPR_REPLAY_SIGNATURE_THREADS
   [[ "$NATIVE_REPLAY" == 0 || "$NATIVE_REPLAY" == 1 ]] || \
     fail "XPR_REPLAY_NATIVE_REPLAY must be 0 or 1"
+  [[ "$TRUST_LEGACY_CHECKPOINT" == 0 || "$TRUST_LEGACY_CHECKPOINT" == 1 ]] || \
+    fail "XPR_REPLAY_TRUST_LEGACY_CHECKPOINT must be 0 or 1"
   [[ -z "$LAST_BLOCK" ]] || validate_uint "$LAST_BLOCK" XPR_REPLAY_LAST_BLOCK
   [[ -x "$BINARY" ]] || fail "replay binary is missing; run '$0 build' first"
   [[ -s "$SOURCE_DIR/blocks.log" ]] || fail "missing $SOURCE_DIR/blocks.log"
@@ -80,6 +84,12 @@ start_replay() {
   )
   if [[ "$NATIVE_REPLAY" == 1 ]]; then
     command+=("PULSEVM_XPR_NATIVE_REPLAY=1")
+  fi
+  if [[ -n "$TRACE_RAM_ACCOUNT" ]]; then
+    command+=("XPR_REPLAY_TRACE_RAM_ACCOUNT=$TRACE_RAM_ACCOUNT")
+  fi
+  if [[ "$TRUST_LEGACY_CHECKPOINT" == 1 ]]; then
+    command+=("XPR_REPLAY_TRUST_LEGACY_CHECKPOINT=1")
   fi
   command+=("$BINARY" "$SOURCE_DIR" "$ARENA_DIR")
   [[ -z "$LAST_BLOCK" ]] || command+=("$LAST_BLOCK")
@@ -136,6 +146,9 @@ Environment:
   XPR_REPLAY_CHECKPOINT_INTERVAL Durable checkpoint interval (default: 1000000)
   XPR_REPLAY_SIGNATURE_THREADS   Header signature workers (default: 8)
   XPR_REPLAY_NATIVE_REPLAY       Enable audited native XPR handlers: 0 or 1 (default: 1)
+  XPR_REPLAY_TRACE_RAM_ACCOUNT   Optional account whose RAM changes are logged by block
+  XPR_REPLAY_TRUST_LEGACY_CHECKPOINT
+                                  Trust and mark an independently validated unversioned checkpoint
 EOF
 }
 

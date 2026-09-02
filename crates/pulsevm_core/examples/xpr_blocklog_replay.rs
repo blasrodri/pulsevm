@@ -54,6 +54,9 @@ const PARTIAL_SCAN_WINDOW: usize = 4 * 1024 * 1024;
 const SIGNATURE_BATCH_SIZE: usize = 256;
 const SIGNATURE_PIPELINE_BATCHES: usize = 4;
 const MAX_DEFAULT_SIGNATURE_THREADS: usize = 8;
+const REPLAY_SEMANTICS_VERSION: u32 = 1;
+const LAST_UNMARKED_SAFE_BLOCK: u32 = 18_320_856;
+const REPLAY_SEMANTICS_FILE: &str = "xpr_replay_semantics_version";
 const ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST: [u8; 32] = [
     0x1a, 0x99, 0xa5, 0x9d, 0x87, 0xe0, 0x6e, 0x09, 0xec, 0x5b, 0x02, 0x8a, 0x9c, 0xbb, 0x77, 0x49,
     0xb4, 0xa5, 0xad, 0x88, 0x19, 0x00, 0x43, 0x65, 0xd0, 0x2d, 0xc4, 0x37, 0x9a, 0x8b, 0x72, 0x41,
@@ -78,6 +81,38 @@ enum BlockOffsets {
     /// Indexless partial downloads still need the offsets discovered while
     /// scanning, because there is no on-disk index to stream.
     Scanned(Vec<u64>),
+}
+
+fn verify_replay_checkpoint_semantics(arena_dir: &Path, revision: u32) -> Result<()> {
+    let path = arena_dir.join(REPLAY_SEMANTICS_FILE);
+    match fs::read_to_string(&path) {
+        Ok(value) => {
+            let version = value
+                .trim()
+                .parse::<u32>()
+                .with_context(|| format!("invalid replay semantics marker {}", path.display()))?;
+            if version != REPLAY_SEMANTICS_VERSION {
+                bail!(
+                    "Arena checkpoint uses XPR replay semantics version {version}, but this binary requires {REPLAY_SEMANTICS_VERSION}"
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let trusted = env::var("XPR_REPLAY_TRUST_LEGACY_CHECKPOINT").as_deref() == Ok("1");
+            if revision > LAST_UNMARKED_SAFE_BLOCK && !trusted {
+                bail!(
+                    "unmarked Arena checkpoint at block {revision} may contain RAM state produced before deferred-transaction retirement was fixed; restart at or before block {LAST_UNMARKED_SAFE_BLOCK}, or set XPR_REPLAY_TRUST_LEGACY_CHECKPOINT=1 only after independent state validation"
+                );
+            }
+            fs::write(&path, format!("{REPLAY_SEMANTICS_VERSION}\n"))
+                .with_context(|| format!("write replay semantics marker {}", path.display()))?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read replay semantics marker {}", path.display()));
+        }
+    }
+    Ok(())
 }
 
 impl BlockOffsets {
@@ -450,6 +485,10 @@ async fn main() -> Result<()> {
         })
         .transpose()?;
     let inspect_schedules = env::var_os("XPR_REPLAY_INSPECT_SCHEDULES").is_some();
+    let trace_ram_account = env::var("XPR_REPLAY_TRACE_RAM_ACCOUNT")
+        .ok()
+        .map(|value| Name::from_str(&value).context("invalid XPR_REPLAY_TRACE_RAM_ACCOUNT"))
+        .transpose()?;
     let checkpoint_interval = env::var("XPR_REPLAY_CHECKPOINT_INTERVAL")
         .ok()
         .map(|value| {
@@ -548,6 +587,7 @@ async fn main() -> Result<()> {
         controller.database().enable_xpr_native_replay();
     }
     let local_tip = controller.last_accepted_block();
+    verify_replay_checkpoint_semantics(&arena_dir, local_tip.block_num())?;
     if local_tip.block_num() == 1 && local_tip.id()?.to_string() != XPR_BLOCK_ONE_ID {
         bail!(
             "authored genesis id {} is not canonical XPR block 1",
@@ -692,6 +732,11 @@ async fn main() -> Result<()> {
         })?;
 
     let mut block_num = start;
+    let mut traced_ram_usage = trace_ram_account.and_then(|account| {
+        controller
+            .database()
+            .arena_account_ram_usage(account.as_u64())
+    });
     while block_num <= last {
         let batch = signature_receiver
             .recv()
@@ -719,6 +764,21 @@ async fn main() -> Result<()> {
                 .with_context(|| {
                     format!("XPR parity divergence accepting block {block_num} {block_id}")
                 })?;
+
+            if let Some(account) = trace_ram_account {
+                let current = controller
+                    .database()
+                    .arena_account_ram_usage(account.as_u64());
+                if current != traced_ram_usage {
+                    eprintln!(
+                        "RAM trace block {block_num} {block_id}: account={account} before={traced_ram_usage:?} after={current:?} delta={:?}",
+                        current
+                            .zip(traced_ram_usage)
+                            .map(|(after, before)| i128::from(after) - i128::from(before))
+                    );
+                    traced_ram_usage = current;
+                }
+            }
 
             if block_num % checkpoint_interval == 0 || block_num == last {
                 // Bulk replay defers the per-block block-log durability barrier.
@@ -750,4 +810,38 @@ async fn main() -> Result<()> {
         started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marks_an_unversioned_checkpoint_before_the_historical_refund() {
+        let temp = tempfile::tempdir().unwrap();
+        verify_replay_checkpoint_semantics(temp.path(), LAST_UNMARKED_SAFE_BLOCK).unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join(REPLAY_SEMANTICS_FILE)).unwrap(),
+            format!("{REPLAY_SEMANTICS_VERSION}\n")
+        );
+    }
+
+    #[test]
+    fn rejects_an_unversioned_checkpoint_after_the_historical_refund() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = verify_replay_checkpoint_semantics(
+            temp.path(),
+            LAST_UNMARKED_SAFE_BLOCK.saturating_add(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("may contain RAM state"));
+    }
+
+    #[test]
+    fn rejects_a_checkpoint_from_another_semantics_version() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(REPLAY_SEMANTICS_FILE), "0\n").unwrap();
+        let error = verify_replay_checkpoint_semantics(temp.path(), 1).unwrap_err();
+        assert!(error.to_string().contains("requires 1"));
+    }
 }
