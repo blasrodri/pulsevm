@@ -2626,7 +2626,7 @@ impl Controller {
         action_receipt_digests.extend(onblock_digests);
         if schedule_promoted {
             let producers = self.block_active_schedule.producers.clone();
-            self.update_producers_authority(&producers, block.timestamp())?;
+            self.update_producers_authority(&producers)?;
         }
         // Mirror build_block: onblock's proposal counts like any transaction's,
         // overridden by a later transaction's — keeping verify's re-execution in
@@ -3980,11 +3980,7 @@ impl Controller {
         Ok(1000) // TODO: Implement greylist limit
     }
 
-    fn update_producers_authority(
-        &mut self,
-        producers: &[ProducerKey],
-        pending_block_time: &BlockTimestamp,
-    ) -> Result<(), ChainError> {
+    fn update_producers_authority(&mut self, producers: &[ProducerKey]) -> Result<(), ChainError> {
         let num_producers = producers.len() as u32;
 
         let update_permission = |db: &mut Database,
@@ -4001,12 +3997,7 @@ impl Controller {
                 ));
             }
 
-            db.modify_permission(
-                actor.into(),
-                permission.into(),
-                &auth,
-                &pending_block_time.to_time_point(),
-            )?;
+            db.modify_permission_authority(actor.into(), permission.into(), &auth)?;
 
             Ok(())
         };
@@ -8526,8 +8517,21 @@ mod tests {
             .collect();
 
         controller.activate_producer_schedule(producers.clone())?;
-        let timestamp = *controller.last_accepted_block.timestamp();
-        controller.update_producers_authority(&producers, &timestamp)?;
+        let producer_permissions = [
+            ACTIVE_NAME,
+            MAJORITY_PRODUCERS_PERMISSION_NAME,
+            MINORITY_PRODUCERS_PERMISSION_NAME,
+        ];
+        let timestamps_before: Vec<i64> = producer_permissions
+            .iter()
+            .map(|permission| {
+                controller
+                    .db
+                    .arena_permission_last_updated(PRODS_NAME.into(), (*permission).into())
+                    .expect("producer permission must have a timestamp")
+            })
+            .collect();
+        controller.update_producers_authority(&producers)?;
 
         // With 5 producers the thresholds are all distinct: more than 2/3 → 4,
         // more than 1/2 → 3, more than 1/3 → 2.
@@ -8552,6 +8556,19 @@ mod tests {
                 threshold
             );
         }
+        let timestamps_after: Vec<i64> = producer_permissions
+            .iter()
+            .map(|permission| {
+                controller
+                    .db
+                    .arena_permission_last_updated(PRODS_NAME.into(), (*permission).into())
+                    .expect("producer permission must have a timestamp")
+            })
+            .collect();
+        assert_eq!(
+            timestamps_after, timestamps_before,
+            "schedule maintenance must preserve producer permission timestamps"
+        );
 
         Ok(())
     }

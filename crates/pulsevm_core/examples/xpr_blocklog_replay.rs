@@ -54,10 +54,11 @@ const PARTIAL_SCAN_WINDOW: usize = 4 * 1024 * 1024;
 const SIGNATURE_BATCH_SIZE: usize = 256;
 const SIGNATURE_PIPELINE_BATCHES: usize = 4;
 const MAX_DEFAULT_SIGNATURE_THREADS: usize = 8;
-const REPLAY_SEMANTICS_VERSION: u32 = 3;
-// Version 3 adds chainbase's reserved permission id 0 at genesis. Every older
-// persisted checkpoint is therefore unsafe to resume, even before block 1,205
-// (where version 1 also began underbilling secondary indices).
+const REPLAY_SEMANTICS_VERSION: u32 = 4;
+// Version 4 preserves `last_updated` when schedule promotion maintains the
+// producer permissions, as Leap does. Every older persisted replay checkpoint
+// is unsafe to resume; version 3 added chainbase's reserved permission id 0,
+// while earlier versions also predate secondary-index and deferred fixes.
 const REPLAY_SEMANTICS_FILE: &str = "xpr_replay_semantics_version";
 const ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST: [u8; 32] = [
     0x1a, 0x99, 0xa5, 0x9d, 0x87, 0xe0, 0x6e, 0x09, 0xec, 0x5b, 0x02, 0x8a, 0x9c, 0xbb, 0x77, 0x49,
@@ -107,7 +108,7 @@ fn verify_replay_checkpoint_semantics(
             let trusted = env::var("XPR_REPLAY_TRUST_LEGACY_CHECKPOINT").as_deref() == Ok("1");
             if revision > 0 && !initialized_fresh && !trusted {
                 bail!(
-                    "unmarked Arena checkpoint at block {revision} may omit reserved permission id 0 or contain state produced before secondary-index billing and deferred-transaction retirement were fixed; restart from an empty Arena, or set XPR_REPLAY_TRUST_LEGACY_CHECKPOINT=1 only after independent state validation"
+                    "unmarked Arena checkpoint at block {revision} may contain incorrect producer-permission timestamps, omit reserved permission id 0, or contain state produced before secondary-index billing and deferred-transaction retirement were fixed; restart from an empty Arena, or set XPR_REPLAY_TRUST_LEGACY_CHECKPOINT=1 only after independent state validation"
                 );
             }
             fs::write(&path, format!("{REPLAY_SEMANTICS_VERSION}\n"))
@@ -837,11 +838,7 @@ mod tests {
     fn rejects_any_unversioned_persisted_checkpoint() {
         let temp = tempfile::tempdir().unwrap();
         let error = verify_replay_checkpoint_semantics(temp.path(), 1, false).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("may omit reserved permission id 0")
-        );
+        assert!(error.to_string().contains("omit reserved permission id 0"));
     }
 
     #[test]
@@ -849,6 +846,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join(REPLAY_SEMANTICS_FILE), "0\n").unwrap();
         let error = verify_replay_checkpoint_semantics(temp.path(), 1, false).unwrap_err();
-        assert!(error.to_string().contains("requires 3"));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("requires {REPLAY_SEMANTICS_VERSION}"))
+        );
     }
 }

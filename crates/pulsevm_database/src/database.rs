@@ -1083,6 +1083,12 @@ impl Database {
         decode_authority(&blob).ok()
     }
 
+    /// The permission timestamp stored by the arena. Exposed for consensus
+    /// parity diagnostics and regression tests.
+    pub fn arena_permission_last_updated(&self, owner: u64, perm_name: u64) -> Option<i64> {
+        self.backend.permission_last_updated(owner, perm_name)
+    }
+
     /// Every permission of `owner` as `(perm_name, parent_perm_name, authority)`
     /// in `(owner, perm_name)` order, for the RPC account formatter. Empty when
     /// the requested state is absent.
@@ -4317,6 +4323,28 @@ impl Database {
                 pending_block_time.elapsed.count,
             )
             .map_err(|e| ChainError::InternalError(format!("arena modify_permission: {e:?}")));
+    }
+
+    /// Replace only the producer permission's authority. Leap performs this
+    /// maintenance directly on `permission_object::auth`; unlike `updateauth`,
+    /// it must not change `last_updated`.
+    pub fn modify_permission_authority(
+        &mut self,
+        actor: u64,
+        permission: u64,
+        authority: &Authority,
+    ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::Permission {
+            owner: actor,
+            name: permission,
+        });
+        self.backend
+            .modify_permission_authority(actor, permission, &encode_authority(authority))
+            .map_err(|e| {
+                ChainError::InternalError(format!(
+                    "arena modify producer permission authority: {e:?}"
+                ))
+            })
     }
 
     pub fn update_permission_usage(

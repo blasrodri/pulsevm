@@ -52,6 +52,25 @@ fn permission_create_modify_remove() {
 }
 
 #[test]
+fn producer_authority_update_preserves_permission_timestamp() {
+    let s = db();
+    assert!(s.modify_permission_authority(1, 100, &auth(3)).is_err());
+    s.create_permission(5, -1, 1, 100, 42, &auth(1)).unwrap();
+
+    s.modify_permission_authority(1, 100, &auth(3)).unwrap();
+    assert_eq!(s.permission(1, 100), Some((-1, 3)));
+    assert_eq!(s.permission_last_updated(1, 100), Some(42));
+
+    let root = s.state_root();
+    s.modify_permission_authority(1, 100, &auth(3)).unwrap();
+    assert_eq!(
+        s.state_root(),
+        root,
+        "an unchanged producer authority must not rewrite chain state"
+    );
+}
+
+#[test]
 fn permission_satisfies_walks_parent_chain() {
     let s = db();
     // A tree for owner 1: a(id 1, root) -> b(id 2) -> c(id 3). Parent links are

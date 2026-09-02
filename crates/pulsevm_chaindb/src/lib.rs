@@ -1959,6 +1959,44 @@ impl ChainDatabase {
         Ok(())
     }
 
+    /// Replace only a permission's authority, preserving `last_updated`.
+    ///
+    /// Leap uses this narrower mutation when it maintains the three producer
+    /// permissions at block start. It is intentionally different from the
+    /// `updateauth` path above, which records the pending block time. An
+    /// unchanged authority is a no-op, matching chainbase's conditional write.
+    pub fn modify_permission_authority(
+        &self,
+        owner: u64,
+        perm_name: u64,
+        auth: &[u8],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let found = db
+            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+            .map(|permission| (permission.id(), permission.auth));
+        let (id, old_auth) = found.ok_or_else(|| {
+            DbError::Corrupted(format!(
+                "producer permission {owner}:{perm_name} is missing"
+            ))
+        })?;
+        if db.blob::<PermissionRow>(old_auth)? == auth {
+            return Ok(());
+        }
+        let auth_blob = db.alloc_blob::<PermissionRow>(auth)?;
+        db.modify::<PermissionRow>(id, |permission| permission.auth = auth_blob)?;
+        Ok(())
+    }
+
+    /// Consensus timestamp recorded on the permission row.
+    pub fn permission_last_updated(&self, owner: u64, perm_name: u64) -> Option<i64> {
+        let db = self.read();
+        db.find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
+            .ok()
+            .flatten()
+            .map(|permission| permission.last_updated)
+    }
+
     /// Permission snapshot for diffing: `(parent id, authority threshold)`. The
     /// threshold is the first field of the encoded `shared_authority` blob, so it
     /// is read straight off the blob without decoding the whole authority.
