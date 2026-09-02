@@ -308,6 +308,23 @@ current irreversible block, catches nodeos up to that boundary, verifies its
 block ID, and writes `corpus-report.json`. Replay that immutable corpus through
 the production verification and acceptance path:
 
+Provider chainbase state records the compiler and CPU architecture that created
+it. On an ARM replay host, run the official AMD64 Leap binary under Docker
+instead of opening an AMD64 state file with the native ARM build:
+
+```bash
+sudo apt-get install -y qemu-user-static binfmt-support
+scripts/run-xpr-mainnet-catchup-amd64.sh build
+scripts/run-xpr-mainnet-catchup-amd64.sh start
+scripts/run-xpr-mainnet-catchup-amd64.sh status
+```
+
+The state, `blocks.log`, `blocks.index`, and
+`blocks/reversible/fork_db.dat` must all come from the same provider archive.
+The runner derives the chainbase size from the state file, uses light nodeos
+validation only to acquire blocks, and keeps the container running across host
+reboots. PulseVM still fully verifies every acquired block during replay.
+
 ```bash
 XPR_REPLAY_CHECKPOINT_INTERVAL=1000000 \
   cargo run --release --locked -p pulsevm_core \
