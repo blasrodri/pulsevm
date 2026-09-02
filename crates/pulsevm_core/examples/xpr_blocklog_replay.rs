@@ -54,11 +54,12 @@ const PARTIAL_SCAN_WINDOW: usize = 4 * 1024 * 1024;
 const SIGNATURE_BATCH_SIZE: usize = 256;
 const SIGNATURE_PIPELINE_BATCHES: usize = 4;
 const MAX_DEFAULT_SIGNATURE_THREADS: usize = 8;
-const REPLAY_SEMANTICS_VERSION: u32 = 1;
-// Block 18,320,857 retires XPR generated transaction
-// ac40631c7db270e120480051f0a6467be933d9535ba6ab33c7e58b5555ae1ece.
-// Checkpoints made by the old replay path after this point can retain its RAM bill.
-const LAST_UNMARKED_SAFE_BLOCK: u32 = 18_320_856;
+const REPLAY_SEMANTICS_VERSION: u32 = 2;
+// Block 1,205 creates XPR's first contract secondary index. Version 1 and
+// unmarked checkpoints after block 1,204 can underbill every secondary row by
+// one chainbase index overhead (32 bytes). They can also retain the generated
+// transaction retired at block 18,320,857, so neither class is safe to resume.
+const LAST_UNMARKED_SAFE_BLOCK: u32 = 1_204;
 const REPLAY_SEMANTICS_FILE: &str = "xpr_replay_semantics_version";
 const ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST: [u8; 32] = [
     0x1a, 0x99, 0xa5, 0x9d, 0x87, 0xe0, 0x6e, 0x09, 0xec, 0x5b, 0x02, 0x8a, 0x9c, 0xbb, 0x77, 0x49,
@@ -104,7 +105,7 @@ fn verify_replay_checkpoint_semantics(arena_dir: &Path, revision: u32) -> Result
             let trusted = env::var("XPR_REPLAY_TRUST_LEGACY_CHECKPOINT").as_deref() == Ok("1");
             if revision > LAST_UNMARKED_SAFE_BLOCK && !trusted {
                 bail!(
-                    "unmarked Arena checkpoint at block {revision} may contain RAM state produced before deferred-transaction retirement was fixed; restart at or before block {LAST_UNMARKED_SAFE_BLOCK}, or set XPR_REPLAY_TRUST_LEGACY_CHECKPOINT=1 only after independent state validation"
+                    "unmarked Arena checkpoint at block {revision} may contain RAM state produced before secondary-index billing and deferred-transaction retirement were fixed; restart at or before block {LAST_UNMARKED_SAFE_BLOCK}, or set XPR_REPLAY_TRUST_LEGACY_CHECKPOINT=1 only after independent state validation"
                 );
             }
             fs::write(&path, format!("{REPLAY_SEMANTICS_VERSION}\n"))
@@ -820,7 +821,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn marks_an_unversioned_checkpoint_before_the_historical_refund() {
+    fn marks_an_unversioned_checkpoint_before_the_first_secondary_index() {
         let temp = tempfile::tempdir().unwrap();
         verify_replay_checkpoint_semantics(temp.path(), LAST_UNMARKED_SAFE_BLOCK).unwrap();
         assert_eq!(
@@ -830,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_unversioned_checkpoint_after_the_historical_refund() {
+    fn rejects_an_unversioned_checkpoint_after_the_first_secondary_index() {
         let temp = tempfile::tempdir().unwrap();
         let error = verify_replay_checkpoint_semantics(
             temp.path(),
@@ -845,6 +846,6 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join(REPLAY_SEMANTICS_FILE), "0\n").unwrap();
         let error = verify_replay_checkpoint_semantics(temp.path(), 1).unwrap_err();
-        assert!(error.to_string().contains("requires 1"));
+        assert!(error.to_string().contains("requires 2"));
     }
 }
