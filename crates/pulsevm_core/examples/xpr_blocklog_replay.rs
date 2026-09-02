@@ -55,6 +55,9 @@ const SIGNATURE_BATCH_SIZE: usize = 256;
 const SIGNATURE_PIPELINE_BATCHES: usize = 4;
 const MAX_DEFAULT_SIGNATURE_THREADS: usize = 8;
 const REPLAY_SEMANTICS_VERSION: u32 = 1;
+// Block 18,320,857 retires XPR generated transaction
+// ac40631c7db270e120480051f0a6467be933d9535ba6ab33c7e58b5555ae1ece.
+// Checkpoints made by the old replay path after this point can retain its RAM bill.
 const LAST_UNMARKED_SAFE_BLOCK: u32 = 18_320_856;
 const REPLAY_SEMANTICS_FILE: &str = "xpr_replay_semantics_version";
 const ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST: [u8; 32] = [
