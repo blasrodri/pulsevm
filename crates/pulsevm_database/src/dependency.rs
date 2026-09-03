@@ -230,6 +230,115 @@ impl TransactionDependencies {
     pub fn can_optimistically_commit_after(&self, prior_writes: &BTreeSet<DependencyKey>) -> bool {
         self.complete && !self.conflicts_with_prior_writes(prior_writes)
     }
+
+    /// Whether two transactions that execute from the same block-prefix
+    /// snapshot have a consensus-state dependency. Receipt/resource counters
+    /// are deliberately excluded: an optimistic executor must allocate and
+    /// apply those in canonical order after action execution. Contract rows,
+    /// deferred queues, authorities, code, schedules, and protocol state remain
+    /// conflict-bearing.
+    pub fn conflicts_for_parallel_execution(&self, other: &Self) -> bool {
+        self.execution_writes()
+            .any(|write| dependencies_observe_write(other, write))
+            || other
+                .execution_writes()
+                .any(|write| dependencies_observe_write(self, write))
+    }
+
+    fn execution_writes(&self) -> impl Iterator<Item = DependencyKey> + '_ {
+        self.writes
+            .iter()
+            .copied()
+            .filter(|key| !is_ordered_commit_bookkeeping(*key))
+    }
+}
+
+fn is_ordered_commit_bookkeeping(key: DependencyKey) -> bool {
+    matches!(
+        key,
+        DependencyKey::System(
+            SystemKey::AccountMetadata(_)
+                | SystemKey::GlobalActionSequence
+                | SystemKey::PermissionUsage { .. }
+                | SystemKey::ResourceUsage(_)
+                | SystemKey::ResourceState
+                | SystemKey::Transaction(_)
+        )
+    )
+}
+
+fn dependencies_observe_write(
+    dependencies: &TransactionDependencies,
+    write: DependencyKey,
+) -> bool {
+    if dependencies.exact_reads.contains(&write) || dependencies.writes.contains(&write) {
+        return true;
+    }
+    match write {
+        DependencyKey::Contract(write) => {
+            dependencies
+                .range_reads
+                .contains(&RangeDependency::Contract(ContractRangeKey::new(
+                    write.code,
+                    write.scope,
+                    write.table,
+                    write.index,
+                )))
+        }
+        DependencyKey::System(SystemKey::Permission { owner, .. }) => {
+            dependencies.range_reads.contains(&RangeDependency::System(
+                SystemRangeKey::PermissionsByOwner(owner),
+            ))
+        }
+        DependencyKey::System(SystemKey::DeferredTransaction(_))
+        | DependencyKey::System(SystemKey::DeferredSender { .. }) => dependencies
+            .range_reads
+            .contains(&RangeDependency::System(SystemRangeKey::DeferredDueQueue)),
+        DependencyKey::System(_) => false,
+    }
+}
+
+/// Observation-only estimate of dependency depth within one canonical block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ParallelWaveEstimate {
+    pub transactions: usize,
+    pub waves: usize,
+    pub max_width: usize,
+    pub conflict_pairs: usize,
+}
+
+/// Assign every transaction to the earliest dependency-safe wave while
+/// preserving canonical order. The resulting depth is an upper-bound input for
+/// engineering the executor, not a consensus decision.
+pub fn estimate_parallel_waves(reports: &[TransactionDependencies]) -> ParallelWaveEstimate {
+    if reports.is_empty() {
+        return ParallelWaveEstimate::default();
+    }
+
+    let mut levels = Vec::with_capacity(reports.len());
+    let mut widths = Vec::<usize>::new();
+    let mut conflict_pairs = 0;
+    for (index, report) in reports.iter().enumerate() {
+        let mut level = 0;
+        for (prior_index, prior) in reports[..index].iter().enumerate() {
+            if report.conflicts_for_parallel_execution(prior) {
+                conflict_pairs += 1;
+                level = level.max(levels[prior_index] + 1);
+            }
+        }
+        levels.push(level);
+        if widths.len() <= level {
+            widths.resize(level + 1, 0);
+        }
+        widths[level] += 1;
+    }
+
+    ParallelWaveEstimate {
+        transactions: reports.len(),
+        waves: widths.len(),
+        max_width: widths.into_iter().max().unwrap_or(0),
+        conflict_pairs,
+    }
 }
 
 #[derive(Clone, Default)]
@@ -410,6 +519,50 @@ mod tests {
             !due_queue.conflicts_with_prior_writes(&BTreeSet::from([DependencyKey::System(
                 SystemKey::Account(17)
             ),]))
+        );
+    }
+
+    #[test]
+    fn wave_estimate_serializes_data_conflicts_but_not_commit_counters() {
+        let row_a =
+            DependencyKey::Contract(ContractRowKey::new(1, 2, 3, ContractIndex::Primary, 10));
+        let row_b =
+            DependencyKey::Contract(ContractRowKey::new(1, 2, 3, ContractIndex::Primary, 11));
+        let bookkeeping = BTreeSet::from([
+            DependencyKey::System(SystemKey::GlobalActionSequence),
+            DependencyKey::System(SystemKey::AccountMetadata(1)),
+            DependencyKey::System(SystemKey::ResourceUsage(7)),
+        ]);
+        let first = TransactionDependencies {
+            writes: BTreeSet::from([row_a])
+                .into_iter()
+                .chain(bookkeeping.iter().copied())
+                .collect(),
+            ..Default::default()
+        };
+        let independent = TransactionDependencies {
+            writes: BTreeSet::from([row_b])
+                .into_iter()
+                .chain(bookkeeping.iter().copied())
+                .collect(),
+            ..Default::default()
+        };
+        let dependent = TransactionDependencies {
+            exact_reads: BTreeSet::from([row_a]),
+            writes: bookkeeping,
+            ..Default::default()
+        };
+
+        assert!(!first.conflicts_for_parallel_execution(&independent));
+        assert!(first.conflicts_for_parallel_execution(&dependent));
+        assert_eq!(
+            estimate_parallel_waves(&[first, independent, dependent]),
+            ParallelWaveEstimate {
+                transactions: 3,
+                waves: 2,
+                max_width: 2,
+                conflict_pairs: 1,
+            }
         );
     }
 }

@@ -45,6 +45,7 @@ pub struct PackedTransaction {
     // Following fields are not serialized
     unpacked_trx: SignedTransaction,
     trx_id: Id,
+    packed_digest: pulsevm_crypto::Digest,
 }
 
 impl PackedTransaction {
@@ -83,6 +84,13 @@ impl PackedTransaction {
             vec![]
         };
         let trx_id: Id = unpacked_trx.id()?;
+        let packed_digest = calculate_packed_digest(
+            &signatures,
+            compression,
+            packed_context_free_data.as_ref(),
+            packed_trx.as_ref(),
+        )
+        .map_err(|error| ChainError::SerializationError(error.to_string()))?;
 
         Ok(Self {
             signatures: signatures.clone(),
@@ -96,6 +104,7 @@ impl PackedTransaction {
                 unpacked_context_free_data,
             ),
             trx_id: trx_id,
+            packed_digest,
         })
     }
 
@@ -147,13 +156,7 @@ impl PackedTransaction {
     /// XPR's `packed_transaction::packed_digest()`: the receipt merkle commits
     /// this digest rather than the full packed-transaction wire encoding.
     pub fn packed_digest(&self) -> Result<pulsevm_crypto::Digest, WriteError> {
-        let mut prunable = self.signatures.pack()?;
-        prunable.extend(pack_fc_bytes(self.packed_context_free_data.as_ref())?);
-
-        let mut encoded = self.compression.pack()?;
-        encoded.extend(pack_fc_bytes(self.packed_trx.as_ref())?);
-        encoded.extend(pulsevm_crypto::Digest::hash(prunable).pack()?);
-        Ok(pulsevm_crypto::Digest::hash(encoded))
+        Ok(self.packed_digest)
     }
 
     #[inline]
@@ -162,22 +165,49 @@ impl PackedTransaction {
             ChainError::SerializationError(format!("failed to get transaction ID: {}", e))
         })?;
 
-        Ok(Self {
-            signatures: trx.signatures().to_vec(),
-            compression: TransactionCompression::None, // Default to no compression for now
-            packed_context_free_data: Bytes::default(), // No context-free data for now
-            packed_trx: trx
-                .transaction()
-                .pack()
-                .map_err(|e| {
-                    ChainError::SerializationError(format!("failed to pack transaction: {}", e))
-                })?
-                .into(),
+        let signatures = trx.signatures().to_vec();
+        let compression = TransactionCompression::None;
+        let packed_context_free_data = Bytes::default();
+        let packed_trx: Bytes = trx
+            .transaction()
+            .pack()
+            .map_err(|e| {
+                ChainError::SerializationError(format!("failed to pack transaction: {}", e))
+            })?
+            .into();
+        let packed_digest = calculate_packed_digest(
+            &signatures,
+            compression,
+            packed_context_free_data.as_ref(),
+            packed_trx.as_ref(),
+        )
+        .map_err(|error| ChainError::SerializationError(error.to_string()))?;
 
+        Ok(Self {
+            signatures,
+            compression,
+            packed_context_free_data,
+            packed_trx,
             unpacked_trx: trx,
             trx_id,
+            packed_digest,
         })
     }
+}
+
+fn calculate_packed_digest(
+    signatures: &[Signature],
+    compression: TransactionCompression,
+    packed_context_free_data: &[u8],
+    packed_trx: &[u8],
+) -> Result<pulsevm_crypto::Digest, WriteError> {
+    let mut prunable = signatures.to_vec().pack()?;
+    prunable.extend(pack_fc_bytes(packed_context_free_data)?);
+
+    let mut encoded = compression.pack()?;
+    encoded.extend(pack_fc_bytes(packed_trx)?);
+    encoded.extend(pulsevm_crypto::Digest::hash(prunable).pack()?);
+    Ok(pulsevm_crypto::Digest::hash(encoded))
 }
 
 /// FC's `bytes` serializer prefixes a byte vector with a varuint length. The

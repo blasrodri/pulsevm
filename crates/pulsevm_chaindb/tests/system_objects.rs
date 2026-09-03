@@ -170,6 +170,26 @@ fn global_action_sequence_roundtrips() {
 }
 
 #[test]
+fn action_receipt_sequences_advance_atomically() {
+    let s = db();
+    s.create_account_metadata(1, false).unwrap();
+    s.create_account_metadata(2, false).unwrap();
+    s.set_global_action_sequence(42).unwrap();
+
+    let sequences = s.next_action_sequences(1, &[1, 2, 1]).unwrap().unwrap();
+    assert_eq!(sequences, (43, 1, vec![1, 1, 2]));
+    assert_eq!(
+        s.account_metadata(1).map(|row| (row.1, row.2)),
+        Some((1, 2))
+    );
+    assert_eq!(s.account_metadata(2).map(|row| row.2), Some(1));
+
+    // A missing receiver is reported so the caller can fail and undo the
+    // enclosing transaction instead of emitting a partial receipt.
+    assert_eq!(s.next_action_sequences(99, &[]).unwrap(), None);
+}
+
+#[test]
 fn undo_reverts_a_whole_session_across_tables() {
     let s = db();
     s.create_account(1, 100).unwrap();

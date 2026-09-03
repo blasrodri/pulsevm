@@ -163,8 +163,15 @@ pub fn setcode(
 
     let code_size = act.code.len() as u64;
     let code_hash: [u8; 32] = if code_size > 0 {
-        // Validate the code before accepting it
-        pulsevm_wasm_validation::validate_wasm(act.code.as_slice()).map_err(|e| {
+        // XPR's source validator accepts standard start sections, and Mainnet
+        // contains historical AssemblyScript contracts that use one. Preserve
+        // PulseVM's stricter admission rule outside the opt-in migration path.
+        let validation = if db.xpr_native_replay_enabled() {
+            pulsevm_wasm_validation::validate_xpr_replay_wasm(act.code.as_slice())
+        } else {
+            pulsevm_wasm_validation::validate_wasm(act.code.as_slice())
+        };
+        validation.map_err(|e| {
             ChainError::TransactionError(format!("contract code failed validation: {}", e))
         })?;
         pulsevm_crypto::Digest::hash(act.code.as_slice()).0
@@ -207,6 +214,13 @@ pub fn setcode(
         act.vm_type,
         act.vm_version,
     )?;
+
+    // Historical replay often has time between deployment and first use. Let
+    // opt-in compiler workers spend that time preparing the content-addressed
+    // module; ordinary nodes have no workers and this is a no-op.
+    if code_size > 0 {
+        context.schedule_wasm_precompile(code_hash, act.code.as_slice().to_vec());
+    }
 
     if new_size != old_size {
         context.add_ram_usage(&act.account, new_size - old_size)?;

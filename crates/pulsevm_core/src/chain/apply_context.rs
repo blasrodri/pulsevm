@@ -5,6 +5,7 @@ use std::{
     },
     sync::{
         Arc,
+        LazyLock,
         RwLock,
     },
     u64,
@@ -61,8 +62,8 @@ use crate::{
     transaction::PackedTransaction,
 };
 
-const FORWARD_SETCODE_FEATURE_DIGEST: [u8; 32] = [
-    0x26, 0x52, 0xf5, 0xf9, 0x60, 0x06, 0x29, 0x41, 0x09, 0xb3, 0xdd, 0x0b, 0xbd, 0xe6, 0x36, 0x96,
+pub(crate) const FORWARD_SETCODE_FEATURE_DIGEST: [u8; 32] = [
+    0x26, 0x52, 0xf5, 0xf9, 0x60, 0x06, 0x29, 0x41, 0x09, 0xb3, 0xdd, 0x0b, 0xbd, 0xe6, 0x36, 0x93,
     0xf5, 0x53, 0x24, 0xaf, 0x45, 0x2b, 0x79, 0x9e, 0xe1, 0x37, 0xa8, 0x1a, 0x90, 0x5e, 0xed, 0x25,
 ];
 
@@ -70,6 +71,19 @@ const RAM_RESTRICTIONS_FEATURE_DIGEST: [u8; 32] = [
     0x4e, 0x7b, 0xf3, 0x48, 0xda, 0x00, 0xa9, 0x45, 0x48, 0x9b, 0x2a, 0x68, 0x17, 0x49, 0xeb, 0x56,
     0xf5, 0xde, 0x00, 0xb9, 0x00, 0x01, 0x4e, 0x13, 0x7d, 0xda, 0xe3, 0x9f, 0x48, 0xf6, 0x9d, 0x67,
 ];
+
+/// Diagnostic-only RAM payer filter for differential replay. Parsing it once
+/// keeps the ordinary consensus path free of repeated environment lookups.
+static XPR_TRACE_RAM_PAYER: LazyLock<Option<u64>> = LazyLock::new(|| {
+    std::env::var("XPR_REPLAY_TRACE_RAM_PAYER")
+        .ok()
+        .and_then(|value| value.parse().ok())
+});
+
+#[inline]
+fn requires_legacy_eager_ram_check(delta: i64, ram_restrictions_activated: bool) -> bool {
+    delta > 0 && !ram_restrictions_activated
+}
 
 const RESTRICT_ACTION_TO_SELF_FEATURE_DIGEST: [u8; 32] = [
     0xad, 0x9e, 0x3d, 0x8f, 0x65, 0x06, 0x87, 0x70, 0x9f, 0xd6, 0x8f, 0x4b, 0x90, 0xb4, 0x1f, 0x7d,
@@ -85,6 +99,74 @@ const NO_DUPLICATE_DEFERRED_ID_FEATURE_DIGEST: [u8; 32] = [
     0x4a, 0x90, 0xc0, 0x0d, 0x55, 0x45, 0x4d, 0xc5, 0xb0, 0x59, 0x05, 0x5c, 0xa2, 0x13, 0x57, 0x9c,
     0x6e, 0xa8, 0x56, 0x96, 0x77, 0x12, 0xa5, 0x60, 0x17, 0x48, 0x78, 0x86, 0xa4, 0xd4, 0xcc, 0x0f,
 ];
+
+/// Apply Leap's inline-action admission rules without requiring an
+/// `ApplyContext`. The XPR migration fast path uses the same validator before
+/// executing a code-hash-pinned inline oracle action directly.
+pub(crate) fn validate_inline_action(
+    db: &mut Database,
+    parent_action: &Action,
+    receiver: Name,
+    privileged: bool,
+    action: &Action,
+) -> Result<(), ChainError> {
+    let send_to_self = action.account() == &receiver;
+    let restrict_action_to_self =
+        db.protocol_feature_activated(RESTRICT_ACTION_TO_SELF_FEATURE_DIGEST);
+    let inherit_parent_authorizations =
+        !restrict_action_to_self && send_to_self && &receiver == parent_action.account();
+
+    pulse_assert(
+        db.is_account(action.account().as_u64())?,
+        ChainError::TransactionError(format!(
+            "inline action's code account {} does not exist",
+            action.account()
+        )),
+    )?;
+
+    let mut inherited_authorizations: BTreeSet<PermissionLevel> = BTreeSet::new();
+    for auth in action.authorization() {
+        pulse_assert(
+            db.is_account(auth.actor)?,
+            ChainError::TransactionError(format!(
+                "inline action's authorizing actor {} does not exist",
+                auth.actor
+            )),
+        )?;
+        pulse_assert(
+            AuthorizationManager::find_permission(&db.read()?, auth)?.is_some(),
+            ChainError::TransactionError(format!(
+                "inline action's authorizations include a non-existent permission: {}",
+                auth
+            )),
+        )?;
+
+        if inherit_parent_authorizations
+            && parent_action
+                .authorization()
+                .iter()
+                .any(|permission| permission == auth)
+        {
+            inherited_authorizations.insert(auth.clone());
+        }
+    }
+
+    if !privileged {
+        let provided_permissions = BTreeSet::from([PermissionLevel::new(
+            receiver.as_u64(),
+            db.system_accounts().code.into(),
+        )]);
+        AuthorizationManager::check_authorization(
+            db,
+            &vec![action.clone()],
+            &BTreeSet::new(),
+            &provided_permissions,
+            Microseconds::new(0),
+            &inherited_authorizations,
+        )?;
+    }
+    Ok(())
+}
 
 const DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST: [u8; 32] = [
     0xfc, 0xe5, 0x7d, 0x23, 0x31, 0x66, 0x73, 0x53, 0xa0, 0xea, 0xc6, 0xb4, 0x20, 0x9b, 0x67, 0xb8,
@@ -193,6 +275,10 @@ impl ApplyContext {
         })
     }
 
+    pub(crate) fn schedule_wasm_precompile(&self, code_hash: [u8; 32], code: Vec<u8>) {
+        self.wasm_runtime.schedule_precompile(code_hash, code);
+    }
+
     pub fn system_accounts(&self) -> pulsevm_database::SystemAccountNames {
         self.db.system_accounts()
     }
@@ -252,21 +338,21 @@ impl ApplyContext {
     }
 
     pub fn exec_one(&mut self) -> Result<u64, ChainError> {
-        let privileged = self.db.is_account_privileged(self.receiver.as_u64())?;
         let mut cpu_used = 100; // Base usage is always 100 instructions
         let action = {
             let mut inner = self.inner.write()?;
             inner.start = Utc::now().timestamp_micros();
-            inner.privileged = privileged;
             inner.action.clone()
         };
+        let metadata = self
+            .db
+            .action_execution_metadata(self.receiver.as_u64(), action.account().as_u64())?;
+        self.inner.write()?.privileged = metadata.privileged;
 
         // These are Antelope controller-native actions, not a replacement for
         // the deployed system WASM. Leap always runs the matching native handler
         // first and then dispatches WASM (except eosio::setcode before
         // FORWARD_SETCODE), including on imported XPR chains.
-        let (code_hash, _vm_type, _vm_version) =
-            self.db.account_code_hash_vm(self.receiver.as_u64())?;
         let native = Controller::find_apply_handler(
             &self.receiver,
             action.account(),
@@ -287,11 +373,21 @@ impl ApplyContext {
         let forward_setcode = self
             .db
             .protocol_feature_activated(FORWARD_SETCODE_FEATURE_DIGEST);
-        let xpr_native_cpu = super::xpr_native_replay::try_apply(self, &action, &code_hash)?;
+        // Chainbase's receiver metadata reference observes the code installed
+        // by the native setcode handler. Once FORWARD_SETCODE is active, the
+        // setcode action must therefore invoke the newly installed code, not
+        // the pre-execution hash captured with the common metadata read above.
+        let execution_code_hash = if is_system_setcode && forward_setcode {
+            self.db.account_code_hash_vm(self.receiver.as_u64())?.0
+        } else {
+            metadata.code_hash
+        };
+        let xpr_native_cpu =
+            super::xpr_native_replay::try_apply(self, &action, &execution_code_hash)?;
         if let Some(native_cpu) = xpr_native_cpu {
             cpu_used += native_cpu;
             self.trx_context.checktime()?;
-        } else if code_hash != [0u8; 32] && (!is_system_setcode || forward_setcode) {
+        } else if execution_code_hash != [0u8; 32] && (!is_system_setcode || forward_setcode) {
             // Separate context here because we need to release the lock on inner before executing
             // the Wasm code, which may call back into the context and cause deadlock if we hold the
             // lock.
@@ -305,7 +401,7 @@ impl ApplyContext {
                 action.clone(),
                 self.clone(),
                 self.db.clone(),
-                &code_hash,
+                &execution_code_hash,
                 cpu_limit,
             )?;
         }
@@ -314,7 +410,7 @@ impl ApplyContext {
         // from increasing another account's RAM without that account's
         // authorization. Notifications are stricter: the receiver may not
         // charge a different account even when the transaction authorizes it.
-        if !privileged
+        if !metadata.privileged
             && self
                 .db
                 .protocol_feature_activated(RAM_RESTRICTIONS_FEATURE_DIGEST)
@@ -348,22 +444,40 @@ impl ApplyContext {
             let inner = self.inner.read()?;
             generate_action_digest(&action, inner.action_return_value.clone())
         };
-        let (code_sequence, abi_sequence) = self
+        let auth_actors = action
+            .authorization()
+            .iter()
+            .map(|auth| auth.actor)
+            .collect::<Vec<_>>();
+        let (global_sequence, recv_sequence, auth_sequences) = self
             .db
-            .account_metadata_code_abi_sequence(action.account().as_u64())?;
+            .next_action_sequences(self.receiver.as_u64(), &auth_actors)?;
+        // Chainbase keeps a stable pointer to the account-metadata object while
+        // executing the action, then reads its sequence fields afterwards.
+        // setcode/setabi mutate those fields in place, so their receipts must
+        // commit the new sequence rather than the pre-execution snapshot.
+        let (code_sequence, abi_sequence) = if self.receiver == system.system
+            && *action.account() == system.system
+            && (*action.name() == crate::chain::config::SETCODE_NAME
+                || *action.name() == crate::chain::config::SETABI_NAME)
+        {
+            self.db
+                .account_metadata_code_abi_sequence(action.account().as_u64())?
+        } else {
+            (metadata.code_sequence, metadata.abi_sequence)
+        };
         let mut receipt = ActionReceipt::new(
             self.receiver.clone(),
             act_digest,
-            self.next_global_sequence()?,
-            self.next_recv_sequence(self.receiver.as_u64())?,
+            global_sequence,
+            recv_sequence,
             CanonicalMap::new(),
             code_sequence as u32,
             abi_sequence as u32,
         );
 
-        for auth in action.clone().authorization().iter() {
-            let auth_sequence = self.next_auth_sequence(auth.actor)?;
-            receipt.add_auth_sequence(auth.actor.clone(), auth_sequence);
+        for (auth, auth_sequence) in action.authorization().iter().zip(auth_sequences) {
+            receipt.add_auth_sequence(auth.actor, auth_sequence);
         }
 
         // Calculate action digest
@@ -464,69 +578,11 @@ impl ApplyContext {
     }
 
     pub fn execute_inline(&mut self, a: &Action) -> Result<(), ChainError> {
-        let action = {
+        let (action, privileged) = {
             let inner = self.inner.read()?;
-            inner.action.clone()
+            (inner.action.clone(), inner.privileged)
         };
-        let send_to_self = a.account() == &self.receiver;
-        let restrict_action_to_self = self
-            .db
-            .protocol_feature_activated(RESTRICT_ACTION_TO_SELF_FEATURE_DIGEST);
-        let inherit_parent_authorizations =
-            !restrict_action_to_self && send_to_self && &self.receiver == action.account();
-
-        {
-            pulse_assert(
-                self.db.is_account(a.account().as_u64())?,
-                ChainError::TransactionError(format!(
-                    "inline action's code account {} does not exist",
-                    a.account()
-                )),
-            )?;
-
-            let mut inherited_authorizations: BTreeSet<PermissionLevel> = BTreeSet::new();
-
-            for auth in a.authorization() {
-                pulse_assert(
-                    self.db.is_account(auth.actor)?,
-                    ChainError::TransactionError(format!(
-                        "inline action's authorizing actor {} does not exist",
-                        auth.actor
-                    )),
-                )?;
-                pulse_assert(
-                    AuthorizationManager::find_permission(&self.db.read()?, auth)?.is_some(),
-                    ChainError::TransactionError(format!(
-                        "inline action's authorizations include a non-existent permission: {}",
-                        auth
-                    )),
-                )?;
-
-                if inherit_parent_authorizations
-                    && action.authorization().iter().any(|pl| pl == auth)
-                {
-                    inherited_authorizations.insert(auth.clone());
-                }
-            }
-
-            let mut provided_permissions = BTreeSet::new();
-            provided_permissions.insert(PermissionLevel::new(
-                *self.receiver,
-                self.db.system_accounts().code.into(),
-            ));
-            let inner = self.inner.read()?;
-
-            if !inner.privileged {
-                AuthorizationManager::check_authorization(
-                    &mut self.db,
-                    &vec![a.clone()],
-                    &BTreeSet::new(),      // No provided keys
-                    &provided_permissions, // Default permission level
-                    Microseconds::new(0),  // No delay
-                    &inherited_authorizations,
-                )?;
-            }
-        }
+        validate_inline_action(&mut self.db, &action, self.receiver, privileged, a)?;
 
         let inline_receiver = a.account();
         let scheduled_ordinal =
@@ -678,6 +734,16 @@ impl ApplyContext {
         // find_or_create_table: bill the new table before the row, only when the
         // table did not already exist.
         if !self.db.arena_table_exists(code, scope, table) {
+            if *XPR_TRACE_RAM_PAYER == Some(payer) {
+                eprintln!(
+                    "RAM object op=create_table code={} scope={} table={} payer={} bytes={}",
+                    Name::new(code),
+                    Name::new(scope),
+                    Name::new(table),
+                    Name::new(payer),
+                    billable_size_v::<TableObject>(),
+                );
+            }
             self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
         }
         self.db.create_key_value_object_standalone(
@@ -696,6 +762,16 @@ impl ApplyContext {
                 .add((code, scope, table, primary_key))
         };
         let billable_size = data.len() as i64 + billable_size_v::<KeyValueObject>() as i64;
+        if *XPR_TRACE_RAM_PAYER == Some(payer) {
+            eprintln!(
+                "RAM object op=store_i64 code={} scope={} table={} primary={primary_key} payer={} value_bytes={} billed_bytes={billable_size}",
+                Name::new(code),
+                Name::new(scope),
+                Name::new(table),
+                Name::new(payer),
+                data.len(),
+            );
+        }
         self.update_db_usage(&payer.into(), billable_size)?;
         Ok(res)
     }
@@ -712,7 +788,7 @@ impl ApplyContext {
         // The handle is the arena's; resolve the row's key and old (payer, value)
         // from the arena and rewrite it there alone. The RAM delta is authored
         // entirely from arena state.
-        let (old_size, old_payer, new_payer) = {
+        let (old_size, old_payer, new_payer, code, scope, table, primary) = {
             let inner = self.inner.read()?;
             let (code, scope, table, primary) = inner
                 .arena_keyval_cache
@@ -738,12 +814,84 @@ impl ApplyContext {
                 new_payer,
                 data.as_ref(),
             )?;
-            (old_size, row_payer, new_payer)
+            (old_size, row_payer, new_payer, code, scope, table, primary)
         };
 
         let overhead = billable_size_v::<KeyValueObject>() as i64;
         let old_size = old_size + overhead;
         let new_size = new_size + overhead;
+        if *XPR_TRACE_RAM_PAYER == Some(old_payer) || *XPR_TRACE_RAM_PAYER == Some(new_payer) {
+            eprintln!(
+                "RAM object op=update_i64 code={} scope={} table={} primary={primary} old_payer={} new_payer={} old_billed_bytes={old_size} new_billed_bytes={new_size} delta={}",
+                Name::new(code),
+                Name::new(scope),
+                Name::new(table),
+                Name::new(old_payer),
+                Name::new(new_payer),
+                if old_payer == new_payer {
+                    new_size - old_size
+                } else {
+                    new_size
+                },
+            );
+        }
+        if old_payer != new_payer {
+            self.update_db_usage(&Name::new(old_payer), -old_size)?;
+            self.update_db_usage(&Name::new(new_payer), new_size)?;
+        } else if old_size != new_size {
+            self.update_db_usage(&Name::new(new_payer), new_size - old_size)?;
+        }
+        Ok(())
+    }
+
+    /// Read a primary contract row by its canonical key without materializing a
+    /// WASM iterator. Code-hash-pinned XPR replay transitions already know the
+    /// exact table and primary key, so routing them through db_find + two db_get
+    /// calls only adds iterator-cache locks and a redundant value copy.
+    pub(crate) fn xpr_native_kv_row(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Result<Option<(u64, Vec<u8>)>, ChainError> {
+        pulse_assert(
+            code == self.receiver.as_u64(),
+            ChainError::TransactionError("db access violation".into()),
+        )?;
+        Ok(self.db.arena_kv_row(code, scope, table, primary))
+    }
+
+    /// Update a row previously returned by [`Self::xpr_native_kv_row`] while
+    /// preserving db_update_i64 payer and RAM-billing semantics. This bypass is
+    /// available only to the opt-in, code-hash-pinned offline replay handlers.
+    pub(crate) fn xpr_native_update_kv(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+        old_payer: u64,
+        old_value_len: usize,
+        payer: u64,
+        data: impl AsRef<[u8]>,
+    ) -> Result<(), ChainError> {
+        pulse_assert(
+            code == self.receiver.as_u64(),
+            ChainError::TransactionError("db access violation".into()),
+        )?;
+        let new_payer = if payer == 0 { old_payer } else { payer };
+        let data = data.as_ref();
+        self.db
+            .xpr_native_update_key_value(code, scope, table, primary, new_payer, data)?;
+
+        let overhead = billable_size_v::<KeyValueObject>() as i64;
+        let old_size = i64::try_from(old_value_len)
+            .map_err(|_| ChainError::InternalError("XPR row length exceeds i64".into()))?
+            + overhead;
+        let new_size = i64::try_from(data.len())
+            .map_err(|_| ChainError::InternalError("XPR row length exceeds i64".into()))?
+            + overhead;
         if old_payer != new_payer {
             self.update_db_usage(&Name::new(old_payer), -old_size)?;
             self.update_db_usage(&Name::new(new_payer), new_size)?;
@@ -2423,14 +2571,28 @@ impl ApplyContext {
     }
 
     pub fn update_db_usage(&mut self, payer: &Name, delta: i64) -> Result<(), ChainError> {
-        if delta > 0 {
-            // Do not allow charging RAM to other accounts during notify
-            let privileged = {
+        if requires_legacy_eager_ram_check(
+            delta,
+            self.db
+                .protocol_feature_activated(RAM_RESTRICTIONS_FEATURE_DIGEST),
+        ) {
+            // Before RAM_RESTRICTIONS, Leap performs this eager authorization
+            // check for each positive charge. After activation it deliberately
+            // defers validation until the action has finished, so a temporary
+            // charge which is refunded by the same notification is judged by
+            // its net account delta.
+            let (privileged, action_account) = {
                 let inner = self.inner.read()?;
-                inner.privileged
+                (inner.privileged, *inner.action.account())
             };
 
             if !(privileged || *payer == self.receiver.as_u64()) {
+                pulse_assert(
+                    self.receiver == action_account,
+                    ChainError::TransactionError(
+                        "cannot charge RAM to other accounts during notify".into(),
+                    ),
+                )?;
                 self.require_authorization(payer, None).map_err(|_| {
                     ChainError::TransactionError(format!(
                         "cannot charge RAM to other accounts during notify"
@@ -2440,6 +2602,16 @@ impl ApplyContext {
         }
 
         self.add_ram_usage(payer, delta)?;
+        if *XPR_TRACE_RAM_PAYER == Some(payer.as_u64()) {
+            let action = self.inner.read()?.action.clone();
+            eprintln!(
+                "RAM charge receiver={} action={}::{} payer={} delta={delta}",
+                self.receiver,
+                action.account(),
+                action.name(),
+                payer,
+            );
+        }
 
         return Ok(());
     }
@@ -2731,8 +2903,16 @@ impl ApplyContext {
         self.trx_context.is_explicitly_billed()
     }
 
+    pub(crate) fn is_implicit(&self) -> Result<bool, ChainError> {
+        self.trx_context.is_implicit()
+    }
+
     pub(crate) fn xpr_native_replay_enabled(&self) -> bool {
         self.db.xpr_native_replay_enabled()
+    }
+
+    pub(crate) fn flush_xpr_native_rows(&self) -> Result<(), ChainError> {
+        self.db.flush_xpr_native_rows()
     }
 
     /// Validated consensus context for the block applying this action.
@@ -2865,6 +3045,19 @@ impl ApplyContext {
 
     pub fn validate_ram_usage(&self, account: &Name) -> Result<(), ChainError> {
         self.trx_context.validate_ram_usage(account)
+    }
+}
+
+#[cfg(test)]
+mod ram_restriction_tests {
+    use super::requires_legacy_eager_ram_check;
+
+    #[test]
+    fn activation_defers_ram_validation_to_the_net_action_delta() {
+        assert!(requires_legacy_eager_ram_check(1, false));
+        assert!(!requires_legacy_eager_ram_check(1, true));
+        assert!(!requires_legacy_eager_ram_check(0, false));
+        assert!(!requires_legacy_eager_ram_check(-1, false));
     }
 }
 

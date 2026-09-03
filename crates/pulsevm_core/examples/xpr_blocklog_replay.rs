@@ -23,7 +23,10 @@ use std::{
     str::FromStr,
     sync::mpsc::sync_channel,
     thread,
-    time::Instant,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use anyhow::{
@@ -42,9 +45,14 @@ use pulsevm_core::{
     id::Id,
     mempool::Mempool,
     name::Name,
+    transaction::TransactionStatus,
 };
 use pulsevm_serialization::Read as PulseRead;
 use serde_json::json;
+use sha2::{
+    Digest,
+    Sha256,
+};
 
 const XPR_CHAIN_ID: &str = "384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0";
 const XPR_BLOCK_ONE_ID: &str = "000000018421bd47ce23d4c47706e0bb98604157afedc67d56d05c82d5aa10c5";
@@ -419,6 +427,29 @@ fn block_mentions_account(block: &SignedBlock, account: Name) -> bool {
     })
 }
 
+fn setcode_payload(data: &[u8]) -> Option<(Name, u8, u8, &[u8])> {
+    let account = Name::new(u64::from_le_bytes(data.get(..8)?.try_into().ok()?));
+    let vm_type = *data.get(8)?;
+    let vm_version = *data.get(9)?;
+    let mut position = 10;
+    let mut length = 0usize;
+    let mut shift = 0u32;
+    loop {
+        let byte = *data.get(position)?;
+        position += 1;
+        length |= usize::from(byte & 0x7f).checked_shl(shift)?;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift >= 32 {
+            return None;
+        }
+    }
+    let code = data.get(position..position.checked_add(length)?)?;
+    (position + length == data.len()).then_some((account, vm_type, vm_version, code))
+}
+
 fn authenticate_signature_batch(
     batch: Vec<PreparedMigrationBlock>,
     thread_count: usize,
@@ -496,6 +527,7 @@ async fn main() -> Result<()> {
         .ok()
         .map(|value| Name::from_str(&value).context("invalid XPR_REPLAY_TRACE_RAM_ACCOUNT"))
         .transpose()?;
+    let profile_replay = env::var_os("XPR_REPLAY_PROFILE").is_some();
     let checkpoint_interval = env::var("XPR_REPLAY_CHECKPOINT_INTERVAL")
         .ok()
         .map(|value| {
@@ -533,6 +565,85 @@ async fn main() -> Result<()> {
     let last = requested_last.unwrap_or(source_last).min(source_last);
     if last < 1 {
         bail!("source block log has no genesis block");
+    }
+
+    // Scan top-level deployment actions directly from packed blocks, without
+    // opening an Arena database. Indirect setcode actions (for example an
+    // eosio.msig::exec inline action) are not present in the packed transaction;
+    // pair this output with the code object's first_block_used metadata.
+    if let Ok(account_list) = env::var("XPR_REPLAY_SCAN_SETCODE") {
+        let final_block = debug_block
+            .context("XPR_REPLAY_SCAN_SETCODE requires XPR_REPLAY_DEBUG_BLOCK=<height>")?;
+        let first_block = env::var("XPR_REPLAY_INSPECT_FROM")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .context("invalid XPR_REPLAY_INSPECT_FROM")
+            })
+            .transpose()?
+            .unwrap_or(1);
+        if first_block > final_block || final_block > source_last {
+            bail!("requested setcode scan is outside the source block log");
+        }
+        let accounts = account_list
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(Name::from_str)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let eosio = Name::from_str("eosio")?;
+        let setcode = Name::from_str("setcode")?;
+        let output_directory = env::var_os("XPR_REPLAY_SETCODE_DIR").map(PathBuf::from);
+        eprintln!(
+            "scanning executed top-level setcode actions; indirect/deferred deployments require code-object metadata"
+        );
+        if let Some(directory) = &output_directory {
+            fs::create_dir_all(directory)?;
+        }
+        for block_num in first_block..=final_block {
+            let packed = source.packed_block(block_num)?;
+            let block = SignedBlock::read(&packed, &mut 0)
+                .map_err(|error| anyhow::anyhow!("decode source block {block_num}: {error}"))?;
+            for receipt in &block.transactions {
+                // Only an executed receipt can mutate the deployed code. Failed
+                // setcode attempts remain in packed block history but must not
+                // become native-accelerator activation boundaries.
+                if receipt.status() != &TransactionStatus::Executed {
+                    continue;
+                }
+                let Some(transaction) = receipt.packed_trx().map(|packed| packed.get_transaction())
+                else {
+                    continue;
+                };
+                for action in &transaction.actions {
+                    if action.account() != &eosio || action.name() != &setcode {
+                        continue;
+                    }
+                    let action_data = action.data();
+                    let Some((account, vm_type, vm_version, code)) =
+                        setcode_payload(action_data.as_ref())
+                    else {
+                        bail!("malformed eosio::setcode payload at block {block_num}");
+                    };
+                    if accounts.is_empty() || accounts.contains(&account) {
+                        let code_hash = hex::encode(Sha256::digest(code));
+                        println!(
+                            "block={block_num} account={account} vm_type={vm_type} vm_version={vm_version} code_bytes={} code_hash={}",
+                            code.len(),
+                            code_hash
+                        );
+                        if let Some(directory) = &output_directory {
+                            fs::write(
+                                directory.join(format!("{block_num}-{account}-{code_hash}.wasm")),
+                                code,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(());
     }
 
     // Decode packed source blocks without constructing a controller or scanning
@@ -591,8 +702,13 @@ async fn main() -> Result<()> {
             .to_str()
             .context("arena directory is not valid UTF-8")?,
     )?;
-    if env::var_os("PULSEVM_XPR_NATIVE_REPLAY").is_some() {
+    if env::var("PULSEVM_XPR_NATIVE_REPLAY").as_deref() == Ok("1") {
         controller.database().enable_xpr_native_replay();
+        eprintln!("XPR native replay accelerators enabled");
+    }
+    if env::var("XPR_REPLAY_DEFER_NATIVE_WRITES").as_deref() == Ok("1") {
+        controller.database().enable_xpr_deferred_native_writes();
+        eprintln!("XPR native writes deferred to fallback/checkpoint boundaries");
     }
     let local_tip = controller.last_accepted_block();
     verify_replay_checkpoint_semantics(&arena_dir, local_tip.block_num(), initialized_fresh)?;
@@ -707,18 +823,15 @@ async fn main() -> Result<()> {
                 let mut batch = Vec::with_capacity(SIGNATURE_BATCH_SIZE);
                 for block_num in start..=last {
                     let packed = source.packed_block(block_num)?;
-                    let block = SignedBlock::read(&packed, &mut 0).map_err(|error| {
-                        anyhow::anyhow!("decode source block {block_num}: {error}")
-                    })?;
-                    if block.block_num() != block_num {
+                    let prepared = authenticator
+                        .prepare_packed(packed)
+                        .with_context(|| format!("prepare canonical source block {block_num}"))?;
+                    if prepared.block_num() != block_num {
                         bail!(
                             "source index entry {block_num} decoded as block {}",
-                            block.block_num()
+                            prepared.block_num()
                         );
                     }
-                    let prepared = authenticator
-                        .prepare(block)
-                        .with_context(|| format!("prepare canonical source block {block_num}"))?;
                     batch.push(prepared);
                     if batch.len() == SIGNATURE_BATCH_SIZE {
                         let authenticated = authenticate_signature_batch(batch, signature_threads)?;
@@ -740,17 +853,30 @@ async fn main() -> Result<()> {
         })?;
 
     let mut block_num = start;
+    let mut empty_blocks = 0u64;
+    let mut transaction_receipts = 0u64;
+    let mut signature_wait_time = Duration::ZERO;
+    let mut verify_time = Duration::ZERO;
+    let mut accept_time = Duration::ZERO;
     let mut traced_ram_usage = trace_ram_account.and_then(|account| {
         controller
             .database()
             .arena_account_ram_usage(account.as_u64())
     });
     while block_num <= last {
+        let signature_wait_started = Instant::now();
         let batch = signature_receiver
             .recv()
             .context("signature prefetch worker stopped before the replay completed")??;
+        if profile_replay {
+            signature_wait_time += signature_wait_started.elapsed();
+        }
         for authenticated in batch {
             let block = authenticated.block();
+            if block.transactions.is_empty() {
+                empty_blocks += 1;
+            }
+            transaction_receipts += block.transactions.len() as u64;
             if block.block_num() != block_num {
                 bail!(
                     "signature pipeline yielded block {}, expected {block_num}",
@@ -761,17 +887,25 @@ async fn main() -> Result<()> {
                 dump_block(block_num, block);
             }
             let block_id = block.id()?;
+            let verify_started = Instant::now();
             controller
                 .verify_authenticated_migration_block(&authenticated, &mut mempool)
                 .await
                 .with_context(|| {
                     format!("XPR parity divergence verifying block {block_num} {block_id}")
                 })?;
+            if profile_replay {
+                verify_time += verify_started.elapsed();
+            }
+            let accept_started = Instant::now();
             controller
-                .accept_block(&block_id, &mut mempool)
+                .accept_authenticated_migration_block(&authenticated, &mut mempool)
                 .with_context(|| {
                     format!("XPR parity divergence accepting block {block_num} {block_id}")
                 })?;
+            if profile_replay {
+                accept_time += accept_started.elapsed();
+            }
 
             if let Some(account) = trace_ram_account {
                 let current = controller
@@ -795,6 +929,7 @@ async fn main() -> Result<()> {
                 // behind a state revision that depends on it.
                 controller.sync_accepted_logs()?;
                 controller.database().close()?;
+                controller.persist_migration_header_state()?;
             }
             if block_num % 10_000 == 0 || block_num == last {
                 let elapsed = started.elapsed().as_secs_f64();
@@ -814,9 +949,22 @@ async fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("signature prefetch worker panicked"))?;
 
     println!(
-        "XPR replay passed through block {last} in {:.1}s",
-        started.elapsed().as_secs_f64()
+        "XPR replay passed through block {last} in {:.1}s ({empty_blocks} empty blocks, {transaction_receipts} transaction receipts)",
+        started.elapsed().as_secs_f64(),
     );
+    if profile_replay {
+        let blocks = u64::from(last - start + 1);
+        let micros_per_block = |duration: Duration| duration.as_micros() as f64 / blocks as f64;
+        println!(
+            "XPR replay profile: signature_wait={:.3}s ({:.1} us/block), verify={:.3}s ({:.1} us/block), accept={:.3}s ({:.1} us/block)",
+            signature_wait_time.as_secs_f64(),
+            micros_per_block(signature_wait_time),
+            verify_time.as_secs_f64(),
+            micros_per_block(verify_time),
+            accept_time.as_secs_f64(),
+            micros_per_block(accept_time),
+        );
+    }
     Ok(())
 }
 
@@ -851,5 +999,23 @@ mod tests {
                 .to_string()
                 .contains(&format!("requires {REPLAY_SEMANTICS_VERSION}"))
         );
+    }
+
+    #[test]
+    fn setcode_payload_parser_is_bounded_and_exact() {
+        let account = Name::from_str("oracles").unwrap();
+        let mut payload = account.as_u64().to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0, 0, 3, 1, 2, 3]);
+        let (decoded, vm_type, vm_version, code) = setcode_payload(&payload).unwrap();
+        assert_eq!(decoded, account);
+        assert_eq!((vm_type, vm_version), (0, 0));
+        assert_eq!(code, [1, 2, 3]);
+
+        let mut trailing = payload.clone();
+        trailing.push(4);
+        assert!(setcode_payload(&trailing).is_none());
+
+        payload[10] = 4;
+        assert!(setcode_payload(&payload).is_none());
     }
 }

@@ -1,5 +1,6 @@
 use core::fmt;
 use std::{
+    borrow::Cow,
     collections::{
         BTreeSet,
         HashMap,
@@ -14,6 +15,10 @@ use std::{
     path::Path,
     str::FromStr,
     sync::LazyLock,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use crate::{
@@ -75,12 +80,14 @@ use crate::{
         },
         state_sync,
         transaction::{
+            ActionReceipt,
             PackedTransaction,
             SignedTransaction,
             Transaction,
             TransactionHeader,
             TransactionReceipt,
             TransactionTrace,
+            generate_action_digest,
         },
         transaction_context::{
             TransactionContext,
@@ -114,6 +121,10 @@ const DISABLE_DEFERRED_TRXS_STAGE_2_FEATURE_DIGEST: [u8; 32] = [
 /// transaction. Presence enables it; unset is the production default.
 static DEPENDENCY_TELEMETRY_ENABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var_os("PULSEVM_DEPENDENCY_TELEMETRY").is_some());
+static PARALLEL_WAVE_TELEMETRY_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("PULSEVM_PARALLEL_WAVE_TELEMETRY").is_some());
+static XPR_BATCHED_REPLAY_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("PULSEVM_XPR_BATCHED_REPLAY").as_deref() == Ok("1"));
 use pulsevm_crypto::{
     Bytes,
     Digest,
@@ -129,11 +140,14 @@ use pulsevm_database::{
     MigrationManifest,
     PermissionLevelWeight,
     TimePoint,
+    TransactionDependencies,
+    estimate_parallel_waves,
     seconds,
 };
 use pulsevm_error::ChainError;
 use pulsevm_grpc::vm;
 use pulsevm_serialization::{
+    CanonicalMap,
     Read,
     Write,
 };
@@ -317,6 +331,7 @@ pub struct MigrationBlockAuthenticator {
 pub struct AuthenticatedMigrationBlock {
     block: SignedBlock,
     signer: PublicKey,
+    packed: Option<Vec<u8>>,
 }
 
 /// Header proof prepared in canonical order but not yet subjected to expensive
@@ -325,6 +340,7 @@ pub struct AuthenticatedMigrationBlock {
 #[doc(hidden)]
 pub struct PreparedMigrationBlock {
     block: SignedBlock,
+    packed: Option<Vec<u8>>,
     digest: Digest,
     expected: PublicKey,
     schedule_version: u32,
@@ -333,6 +349,16 @@ pub struct PreparedMigrationBlock {
 impl AuthenticatedMigrationBlock {
     pub fn block(&self) -> &SignedBlock {
         &self.block
+    }
+
+    pub fn packed(&self) -> Option<&[u8]> {
+        self.packed.as_deref()
+    }
+}
+
+impl PreparedMigrationBlock {
+    pub fn block_num(&self) -> u32 {
+        self.block.block_num()
     }
 }
 
@@ -409,6 +435,32 @@ impl HeaderSigningState {
 
 impl MigrationBlockAuthenticator {
     pub fn prepare(&mut self, block: SignedBlock) -> Result<PreparedMigrationBlock, ChainError> {
+        self.prepare_inner(block, None)
+    }
+
+    /// Decode and bind the canonical source bytes to the authenticated block so
+    /// accepted migration replay can append them directly instead of repacking
+    /// every transaction receipt on the serial execution thread.
+    pub fn prepare_packed(
+        &mut self,
+        packed: Vec<u8>,
+    ) -> Result<PreparedMigrationBlock, ChainError> {
+        let mut pos = 0;
+        let block = SignedBlock::read(&packed, &mut pos)?;
+        if pos != packed.len() {
+            return Err(ChainError::SerializationError(format!(
+                "packed migration block has {} trailing bytes",
+                packed.len() - pos
+            )));
+        }
+        self.prepare_inner(block, Some(packed))
+    }
+
+    fn prepare_inner(
+        &mut self,
+        block: SignedBlock,
+        packed: Option<Vec<u8>>,
+    ) -> Result<PreparedMigrationBlock, ChainError> {
         if *block.previous_id() != self.previous_id {
             return Err(ChainError::BlockError(format!(
                 "migration signature stream expected parent {}, found {} for block {}",
@@ -441,6 +493,7 @@ impl MigrationBlockAuthenticator {
         self.previous_id = block_id;
         Ok(PreparedMigrationBlock {
             block,
+            packed,
             digest,
             expected,
             schedule_version: self.schedule_state.active.version,
@@ -466,6 +519,7 @@ impl MigrationBlockAuthenticator {
         Ok(AuthenticatedMigrationBlock {
             block: prepared.block,
             signer,
+            packed: prepared.packed,
         })
     }
 
@@ -719,6 +773,21 @@ pub struct StateSummary {
 const SYNCED_SCHEDULE_FILE: &str = "synced_schedule.bin";
 const SYNCED_SCHEDULE_MAGIC: &[u8; 8] = b"PVMSCH01";
 
+/// Authenticated header state at the durable Arena revision. Bulk migration
+/// checkpoints write this tiny sidecar after the Arena itself is durable. A
+/// matching sidecar avoids decoding the complete accepted block log merely to
+/// reconstruct the producer schedule and incremental block-merkle frontier.
+const MIGRATION_HEADER_STATE_FILE: &str = "migration_header_state.bin";
+const MIGRATION_HEADER_STATE_MAGIC: &[u8; 8] = b"PVMHDR01";
+const MAX_MIGRATION_HEADER_NODES: usize = u64::BITS as usize;
+
+struct MigrationHeaderState {
+    revision: u32,
+    block_id: Id,
+    schedule_state: ProducerScheduleState,
+    signing_state: HeaderSigningState,
+}
+
 /// Durable poison marker for the multi-file state-sync publication window.
 /// Its presence makes startup fail closed; successful application removes it
 /// only after the arena, logs, producer schedule, and in-memory head agree.
@@ -731,6 +800,160 @@ fn sync_directory(path: &Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+fn encode_migration_header_state(state: &MigrationHeaderState) -> Result<Vec<u8>, ChainError> {
+    let active = state.schedule_state.active.pack().map_err(|error| {
+        ChainError::SerializationError(format!("pack migration active schedule: {error}"))
+    })?;
+    let pending = state
+        .schedule_state
+        .pending
+        .as_ref()
+        .map(|schedule| {
+            schedule.pack().map_err(|error| {
+                ChainError::SerializationError(format!("pack migration pending schedule: {error}"))
+            })
+        })
+        .transpose()?;
+    let active_len = u32::try_from(active.len())
+        .map_err(|_| ChainError::InternalError("migration active schedule is too large".into()))?;
+    let pending_len = pending
+        .as_ref()
+        .map(|packed| {
+            u32::try_from(packed.len()).map_err(|_| {
+                ChainError::InternalError("migration pending schedule is too large".into())
+            })
+        })
+        .transpose()?;
+    let node_len = u8::try_from(state.signing_state.blockroot_merkle.active_nodes.len())
+        .map_err(|_| ChainError::InternalError("migration merkle frontier is too deep".into()))?;
+
+    let mut bytes = Vec::with_capacity(
+        8 + 4
+            + 32
+            + 4
+            + active.len()
+            + 4
+            + pending.as_ref().map_or(0, Vec::len)
+            + 8
+            + 1
+            + usize::from(node_len) * 32
+            + 32
+            + 32,
+    );
+    bytes.extend_from_slice(MIGRATION_HEADER_STATE_MAGIC);
+    bytes.extend_from_slice(&state.revision.to_le_bytes());
+    bytes.extend_from_slice(state.block_id.as_bytes());
+    bytes.extend_from_slice(&active_len.to_le_bytes());
+    bytes.extend_from_slice(&active);
+    bytes.extend_from_slice(&pending_len.unwrap_or(u32::MAX).to_le_bytes());
+    if let Some(pending) = pending {
+        bytes.extend_from_slice(&pending);
+    }
+    bytes.extend_from_slice(
+        &state
+            .signing_state
+            .blockroot_merkle
+            .node_count
+            .to_le_bytes(),
+    );
+    bytes.push(node_len);
+    for node in &state.signing_state.blockroot_merkle.active_nodes {
+        bytes.extend_from_slice(node.as_bytes());
+    }
+    bytes.extend_from_slice(state.signing_state.pending_schedule_hash.as_bytes());
+    let checksum = Digest::hash(&bytes);
+    bytes.extend_from_slice(checksum.as_bytes());
+    Ok(bytes)
+}
+
+fn decode_migration_header_state(bytes: &[u8]) -> Result<MigrationHeaderState, ChainError> {
+    fn take<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8], ChainError> {
+        let end = pos.checked_add(len).ok_or_else(|| {
+            ChainError::DatabaseError("migration header state length overflow".into())
+        })?;
+        let value = bytes.get(*pos..end).ok_or_else(|| {
+            ChainError::DatabaseError("migration header state is truncated".into())
+        })?;
+        *pos = end;
+        Ok(value)
+    }
+
+    if bytes.len() < 8 + 4 + 32 + 4 + 4 + 8 + 1 + 32 + 32
+        || &bytes[..8] != MIGRATION_HEADER_STATE_MAGIC
+    {
+        return Err(ChainError::DatabaseError(
+            "migration header state has an invalid header".into(),
+        ));
+    }
+    let payload_len = bytes.len() - 32;
+    if Digest::hash(&bytes[..payload_len]).as_bytes() != &bytes[payload_len..] {
+        return Err(ChainError::DatabaseError(
+            "migration header state failed its checksum".into(),
+        ));
+    }
+
+    let mut pos = 8;
+    let revision = u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().unwrap());
+    let block_id = Id::new(take(bytes, &mut pos, 32)?.try_into().unwrap());
+    let active_len = u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().unwrap()) as usize;
+    let active =
+        ProducerSchedule::read_bounded(take(bytes, &mut pos, active_len)?).map_err(|error| {
+            ChainError::DatabaseError(format!(
+                "decode migration active producer schedule: {error}"
+            ))
+        })?;
+    let pending_len = u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().unwrap());
+    let pending = if pending_len == u32::MAX {
+        None
+    } else {
+        Some(
+            ProducerSchedule::read_bounded(take(bytes, &mut pos, pending_len as usize)?).map_err(
+                |error| {
+                    ChainError::DatabaseError(format!(
+                        "decode migration pending producer schedule: {error}"
+                    ))
+                },
+            )?,
+        )
+    };
+    let node_count = u64::from_le_bytes(take(bytes, &mut pos, 8)?.try_into().unwrap());
+    let frontier_len = usize::from(take(bytes, &mut pos, 1)?[0]);
+    if frontier_len > MAX_MIGRATION_HEADER_NODES {
+        return Err(ChainError::DatabaseError(format!(
+            "migration merkle frontier has {frontier_len} nodes"
+        )));
+    }
+    let mut active_nodes = Vec::with_capacity(frontier_len);
+    for _ in 0..frontier_len {
+        active_nodes.push(Digest(take(bytes, &mut pos, 32)?.try_into().unwrap()));
+    }
+    let pending_schedule_hash = Digest(take(bytes, &mut pos, 32)?.try_into().unwrap());
+    if pos != payload_len {
+        return Err(ChainError::DatabaseError(format!(
+            "migration header state has {} trailing payload bytes",
+            payload_len - pos
+        )));
+    }
+    if node_count != u64::from(revision) {
+        return Err(ChainError::DatabaseError(format!(
+            "migration merkle contains {node_count} blocks at revision {revision}"
+        )));
+    }
+
+    Ok(MigrationHeaderState {
+        revision,
+        block_id,
+        schedule_state: ProducerScheduleState { active, pending },
+        signing_state: HeaderSigningState {
+            blockroot_merkle: IncrementalBlockMerkle {
+                active_nodes,
+                node_count,
+            },
+            pending_schedule_hash,
+        },
+    })
 }
 
 /// The snapshot a node last advertised in a summary, kept so it can serve the
@@ -1281,79 +1504,105 @@ impl Controller {
                 self.last_accepted_block_id = self.last_accepted_block.id()?;
                 self.preferred_id = self.last_accepted_block.id()?;
 
-                // A state-synced node's schedule base isn't in its (re-based) log:
-                // the pre-sync block that set the schedule was never downloaded, so
-                // the log tip may not carry it. Accept persisted the schedule in
-                // force at the snapshot height beside the logs; load it as the base
-                // before reconstruct overlays any newer in-log change. Absent on a
-                // normally-grown chain, where the genesis seed is the base. A
-                // re-based log (start > genesis) must have this file; silently
-                // falling back to genesis producers would reinterpret synced
-                // state after a torn or manually deleted sidecar.
-                let synced = Self::load_synced_schedule(db_path)?;
-                if start > genesis_height && synced.is_none() {
-                    return Err(ChainError::DatabaseError(format!(
-                        "state-synced block log starts at height {start}, but {} is missing",
-                        SYNCED_SCHEDULE_FILE
-                    )));
-                }
-                if let Some(synced) = synced {
-                    self.active_schedule = synced;
-                }
-
-                // Rebuild schedule and Antelope signing state in one sequential
-                // pass. `block_range` holds one buffered descriptor, avoiding two
-                // full scans and five filesystem syscalls per historical block.
                 let antelope_signatures = self
                     .node_config
                     .as_ref()
                     .is_some_and(|config| config.antelope_block_signatures);
-                let mut schedule_state = ProducerScheduleState {
-                    active: self.active_schedule.clone(),
-                    pending: None,
-                };
-                let mut signing_state = self.header_signing_state.clone();
-                let schedule_scan_start = start.saturating_add(1);
-                let signing_scan_start = start.max(genesis_height + 1);
-                let scan_start = if antelope_signatures {
-                    schedule_scan_start.min(signing_scan_start)
-                } else {
-                    schedule_scan_start
-                };
-                if scan_start <= end {
-                    let blocks = self
-                        .block_log
-                        .as_ref()
-                        .expect("block log initialized")
-                        .block_range(scan_start, end)
-                        .map_err(|error| {
-                            ChainError::DatabaseError(format!(
-                                "failed to stream accepted block log: {error}"
-                            ))
-                        })?;
-                    for packed in blocks {
-                        let (height, packed) = packed.map_err(|error| {
-                            ChainError::DatabaseError(format!(
-                                "failed to stream accepted block log: {error}"
-                            ))
-                        })?;
-                        let block = SignedBlock::read(&packed, &mut 0).map_err(|error| {
-                            ChainError::DatabaseError(format!(
-                                "failed to decode accepted block {height}: {error}"
-                            ))
-                        })?;
-                        if height >= schedule_scan_start {
-                            schedule_state.apply_header(&block.signed_block_header.header)?;
-                        }
-                        if antelope_signatures && height >= signing_scan_start {
-                            signing_state.accept(&block)?;
+                let migration_replay = self
+                    .node_config
+                    .as_ref()
+                    .is_some_and(|config| !config.state_history_enabled);
+                let cached_header_state = if migration_replay {
+                    match Self::load_migration_header_state(
+                        db_path,
+                        end,
+                        self.last_accepted_block_id,
+                    ) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            warn!(
+                                "ignoring invalid migration header state and rebuilding from the accepted log: {error}"
+                            );
+                            None
                         }
                     }
-                }
-                self.active_schedule = schedule_state.active;
-                self.pending_schedule = schedule_state.pending;
-                if antelope_signatures {
-                    self.header_signing_state = signing_state;
+                } else {
+                    None
+                };
+                if let Some(cached) = cached_header_state {
+                    self.active_schedule = cached.schedule_state.active;
+                    self.pending_schedule = cached.schedule_state.pending;
+                    if antelope_signatures {
+                        self.header_signing_state = cached.signing_state;
+                    }
+                    info!(
+                        "restored migration header state at block {end} without scanning accepted history"
+                    );
+                } else {
+                    // A state-synced node's schedule base isn't in its (re-based)
+                    // log. Load the schedule persisted beside its snapshot before
+                    // reconstructing any newer in-log changes.
+                    let synced = Self::load_synced_schedule(db_path)?;
+                    if start > genesis_height && synced.is_none() {
+                        return Err(ChainError::DatabaseError(format!(
+                            "state-synced block log starts at height {start}, but {} is missing",
+                            SYNCED_SCHEDULE_FILE
+                        )));
+                    }
+                    if let Some(synced) = synced {
+                        self.active_schedule = synced;
+                    }
+
+                    // Rebuild schedule and Antelope signing state in one
+                    // sequential pass when no revision-bound migration sidecar
+                    // is available.
+                    let mut schedule_state = ProducerScheduleState {
+                        active: self.active_schedule.clone(),
+                        pending: None,
+                    };
+                    let mut signing_state = self.header_signing_state.clone();
+                    let schedule_scan_start = start.saturating_add(1);
+                    let signing_scan_start = start.max(genesis_height + 1);
+                    let scan_start = if antelope_signatures {
+                        schedule_scan_start.min(signing_scan_start)
+                    } else {
+                        schedule_scan_start
+                    };
+                    if scan_start <= end {
+                        let blocks = self
+                            .block_log
+                            .as_ref()
+                            .expect("block log initialized")
+                            .block_range(scan_start, end)
+                            .map_err(|error| {
+                                ChainError::DatabaseError(format!(
+                                    "failed to stream accepted block log: {error}"
+                                ))
+                            })?;
+                        for packed in blocks {
+                            let (height, packed) = packed.map_err(|error| {
+                                ChainError::DatabaseError(format!(
+                                    "failed to stream accepted block log: {error}"
+                                ))
+                            })?;
+                            let block = SignedBlock::read(&packed, &mut 0).map_err(|error| {
+                                ChainError::DatabaseError(format!(
+                                    "failed to decode accepted block {height}: {error}"
+                                ))
+                            })?;
+                            if height >= schedule_scan_start {
+                                schedule_state.apply_header(&block.signed_block_header.header)?;
+                            }
+                            if antelope_signatures && height >= signing_scan_start {
+                                signing_state.accept(&block)?;
+                            }
+                        }
+                    }
+                    self.active_schedule = schedule_state.active;
+                    self.pending_schedule = schedule_state.pending;
+                    if antelope_signatures {
+                        self.header_signing_state = signing_state;
+                    }
                 }
             }
         }
@@ -2125,6 +2374,27 @@ impl Controller {
     }
 
     pub fn accept_block(&mut self, block_id: &Id, mempool: &mut Mempool) -> Result<(), ChainError> {
+        self.accept_block_inner(block_id, mempool, None)
+    }
+
+    /// Accept a migration block with the exact source bytes bound during
+    /// authentication, avoiding an otherwise redundant full block repack.
+    #[doc(hidden)]
+    pub fn accept_authenticated_migration_block(
+        &mut self,
+        authenticated: &AuthenticatedMigrationBlock,
+        mempool: &mut Mempool,
+    ) -> Result<(), ChainError> {
+        let block_id = authenticated.block.id()?;
+        self.accept_block_inner(&block_id, mempool, authenticated.packed())
+    }
+
+    fn accept_block_inner(
+        &mut self,
+        block_id: &Id,
+        mempool: &mut Mempool,
+        source_packed: Option<&[u8]>,
+    ) -> Result<(), ChainError> {
         let block = {
             self.verified_blocks
                 .get(block_id)
@@ -2162,9 +2432,12 @@ impl Controller {
         // pack) that bailed via `?` would drop the front session and wrongly undo
         // the chain *tip* (the front is the stack bottom). Doing it here keeps the
         // remove(0)→push() window free of fallible operations.
-        let packed_block = block.pack().map_err(|e| {
-            ChainError::TransactionError(format!("failed to pack block {}: {}", block_id, e))
-        })?;
+        let packed_block = match source_packed {
+            Some(bytes) => Cow::Borrowed(bytes),
+            None => Cow::Owned(block.pack().map_err(|e| {
+                ChainError::TransactionError(format!("failed to pack block {}: {}", block_id, e))
+            })?),
+        };
 
         // The three files form one logical accept record when state-history is
         // enabled. Capture all restore points before changing candidate state,
@@ -2450,13 +2723,24 @@ impl Controller {
         // current head (the parent), not a partially assembled header for the
         // block being executed. This distinction is consensus-visible through
         // the action receipt digest even when the block has no transactions.
-        let parent = self.get_block(previous)?.ok_or_else(|| {
-            ChainError::BlockError(format!(
-                "cannot execute onblock without parent block {}",
-                previous
-            ))
-        })?;
-        let header_bytes = parent.signed_block_header.header.pack().map_err(|e| {
+        let header_bytes = if previous == self.last_accepted_block_id {
+            // Sequential replay already retains the complete parent. Avoid
+            // cloning all of its transaction receipts merely to pack its header
+            // for the next implicit onblock action.
+            self.last_accepted_block.signed_block_header.header.pack()
+        } else {
+            self.get_block(previous)?
+                .ok_or_else(|| {
+                    ChainError::BlockError(format!(
+                        "cannot execute onblock without parent block {}",
+                        previous
+                    ))
+                })?
+                .signed_block_header
+                .header
+                .pack()
+        }
+        .map_err(|e| {
             ChainError::SerializationError(format!("failed to pack onblock header: {}", e))
         })?;
 
@@ -2467,6 +2751,94 @@ impl Controller {
             header_bytes,
             vec![PermissionLevel::new(system.as_u64(), ACTIVE_NAME.as_u64())],
         );
+
+        // Offline XPR migration can reproduce the pinned common onblock path
+        // without allocating the implicit TransactionContext/trace graph. All
+        // consensus-visible state, resource billing, sequence increments, and
+        // receipt hashing remain on the ordinary implementations below; any
+        // boundary/layout mismatch unwinds this nested session and falls back.
+        if self.db.xpr_native_replay_enabled() {
+            let profiling = super::replay_profile::enabled();
+            let direct_started = profiling.then(Instant::now);
+            let mut direct_profile = super::replay_profile::NativeOnblockTiming::default();
+            let metadata_started = profiling.then(Instant::now);
+            let metadata = self
+                .db
+                .action_execution_metadata(system.as_u64(), system.as_u64())?;
+            direct_profile.metadata =
+                metadata_started.map_or(Duration::ZERO, |started| started.elapsed());
+            self.db.arena_start_undo_session();
+            let direct = (|| -> Result<Option<VecDeque<Digest>>, ChainError> {
+                let transition_started = profiling.then(Instant::now);
+                if !super::xpr_native_replay::try_apply_system_onblock_direct(
+                    &mut self.db,
+                    *pending_block_timestamp,
+                    &action,
+                    &metadata.code_hash,
+                )? {
+                    return Ok(None);
+                }
+                direct_profile.state_transition =
+                    transition_started.map_or(Duration::ZERO, |started| started.elapsed());
+
+                let account_usage_started = profiling.then(Instant::now);
+                ResourceLimitsManager::update_account_usage(
+                    &mut self.db,
+                    &system,
+                    pending_block_timestamp.slot(),
+                )?;
+                direct_profile.account_usage =
+                    account_usage_started.map_or(Duration::ZERO, |started| started.elapsed());
+                let receipt_started = profiling.then(Instant::now);
+                let (global_sequence, recv_sequence, auth_sequences) = self
+                    .db
+                    .next_action_sequences(system.as_u64(), &[system.as_u64()])?;
+                let mut receipt = ActionReceipt::new(
+                    system,
+                    generate_action_digest(&action, None),
+                    global_sequence,
+                    recv_sequence,
+                    CanonicalMap::new(),
+                    metadata.code_sequence as u32,
+                    metadata.abi_sequence as u32,
+                );
+                receipt.add_auth_sequence(system.as_u64(), auth_sequences[0]);
+                direct_profile.receipt =
+                    receipt_started.map_or(Duration::ZERO, |started| started.elapsed());
+                let resources_started = profiling.then(Instant::now);
+                let min_cpu = self.db.chain_config()?.min_transaction_cpu_usage;
+                ResourceLimitsManager::add_transaction_usage(
+                    &mut self.db,
+                    &system,
+                    u64::from(min_cpu),
+                    0,
+                    pending_block_timestamp.slot(),
+                    true,
+                )?;
+                direct_profile.resources =
+                    resources_started.map_or(Duration::ZERO, |started| started.elapsed());
+                let digest_started = profiling.then(Instant::now);
+                let digest = receipt.digest()?;
+                direct_profile.receipt +=
+                    digest_started.map_or(Duration::ZERO, |started| started.elapsed());
+                Ok(Some(VecDeque::from([digest])))
+            })();
+            match direct {
+                Ok(Some(digests)) => {
+                    self.db.arena_squash();
+                    direct_profile.total =
+                        direct_started.map_or(Duration::ZERO, |started| started.elapsed());
+                    super::replay_profile::record_native_onblock(direct_profile);
+                    return Ok((digests, None));
+                }
+                Ok(None) => self.db.arena_undo(),
+                Err(error) => {
+                    self.db.arena_undo();
+                    debug!("direct XPR onblock declined: {error}");
+                }
+            }
+        }
+
         let trx = Transaction::new(TransactionHeader::default(), vec![], vec![action]);
         let packed = PackedTransaction::from_signed_transaction(SignedTransaction::new(
             trx.clone(),
@@ -2534,13 +2906,22 @@ impl Controller {
         ),
         ChainError,
     > {
+        let replay_profiling = super::replay_profile::enabled();
+        let block_profile_started = replay_profiling.then(Instant::now);
         // Revalidate here instead of relying on a caller's guard: replay,
         // fallback accept, and future callers must not reach consensus writes
         // without a context for this exact candidate height.
         let protocol_context = self.ensure_protocol_version_supported(block.block_num())?;
+        let collect_transaction_traces = self
+            .node_config
+            .as_ref()
+            .is_none_or(|config| config.state_history_enabled);
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
+        let mut xpr_bot_oracle_cache = super::xpr_native_replay::DirectBotOracleCache::default();
+        let mut dependency_reports = Vec::<TransactionDependencies>::new();
+        let mut untracked_transactions = 0usize;
         self.prepare_protocol_execution(protocol_context)?;
         self.blocks_executed += 1;
 
@@ -2612,17 +2993,21 @@ impl Controller {
             self.db.clear_proposed_schedule()?;
         }
 
+        let expired_started = replay_profiling.then(Instant::now);
         self.db
             .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
+        let expired_elapsed = expired_started.map_or(Duration::ZERO, |started| started.elapsed());
 
         // onblock heads the block: its action digests precede every transaction's.
         let header = &block.signed_block_header.header;
+        let onblock_started = replay_profiling.then(Instant::now);
         let (onblock_digests, mut proposed_schedule) = self.run_onblock(
             protocol_context,
             &header.timestamp,
             header.previous,
             block_status,
         )?;
+        let onblock_elapsed = onblock_started.map_or(Duration::ZERO, |started| started.elapsed());
         action_receipt_digests.extend(onblock_digests);
         if schedule_promoted {
             let producers = self.block_active_schedule.producers.clone();
@@ -2632,10 +3017,79 @@ impl Controller {
         // overridden by a later transaction's — keeping verify's re-execution in
         // agreement with what the producer folded into the header.
 
+        let transactions_started = replay_profiling.then(Instant::now);
         for receipt in &block.transactions {
+            let transaction_started = replay_profiling.then(Instant::now);
             let timestamp = &block.signed_block_header.header.timestamp;
             let transaction_id: [u8; 32] = receipt.transaction_id().as_bytes().try_into().unwrap();
             let deferred = self.db.arena_deferred_transaction(transaction_id);
+
+            // Offline migration does not publish transaction traces. For the
+            // overwhelmingly common pinned bot/oracle receipt, reproduce the
+            // same accepted-block checks, state writes, resource billing and
+            // action receipt digests directly instead of allocating the general
+            // TransactionContext/ActionTrace graph. Any unsupported boundary
+            // declines before mutation and continues through the canonical path.
+            if deferred.is_none()
+                && !collect_transaction_traces
+                && *XPR_BATCHED_REPLAY_ENABLED
+                && receipt.status() == &crate::chain::transaction::TransactionStatus::Executed
+            {
+                if let Some(transaction) = receipt.packed_trx() {
+                    if let Some(digests) =
+                        super::transaction_context::try_execute_xpr_mechanics_from_block(
+                            &mut self.db,
+                            &mut xpr_bot_oracle_cache,
+                            transaction.get_transaction(),
+                            receipt.transaction_id(),
+                            timestamp,
+                            receipt.cpu_usage_us(),
+                            receipt.net_usage_words(),
+                        )?
+                    {
+                        if let Some(started) = transaction_started {
+                            super::replay_profile::record_transaction(
+                                "direct_mechanics",
+                                started.elapsed(),
+                            );
+                        }
+                        transaction_receipts.push_back(receipt.clone());
+                        action_receipt_digests.extend(digests);
+                        if block_status == &BlockStatus::Accepting {
+                            mempool.remove_transaction(transaction.id());
+                        }
+                        continue;
+                    }
+                    if let Some(digests) =
+                        super::transaction_context::try_execute_xpr_bot_from_block(
+                            &mut self.db,
+                            &mut xpr_bot_oracle_cache,
+                            transaction.get_transaction(),
+                            receipt.transaction_id(),
+                            timestamp,
+                            receipt.cpu_usage_us(),
+                            receipt.net_usage_words(),
+                        )?
+                    {
+                        if let Some(started) = transaction_started {
+                            super::replay_profile::record_transaction(
+                                "direct_bot",
+                                started.elapsed(),
+                            );
+                        }
+                        transaction_receipts.push_back(receipt.clone());
+                        action_receipt_digests.extend(digests);
+                        if block_status == &BlockStatus::Accepting {
+                            mempool.remove_transaction(transaction.id());
+                        }
+                        continue;
+                    }
+                }
+            }
+            // A canonical transaction (including setcode/setabi) must observe
+            // every preceding native row update and may invalidate the typed
+            // layouts or code hashes. Flush and clear at this exact boundary.
+            xpr_bot_oracle_cache.flush(&mut self.db, *timestamp)?;
             let (result, reproduced_receipt) = if let Some(deferred) = deferred {
                 let now = timestamp.to_time_point().time_since_epoch().count();
                 let disable_deferred_stage_1 = self
@@ -2689,6 +3143,7 @@ impl Controller {
                             billed_cpu_time_us: 0,
                             action_receipt_digests: VecDeque::new(),
                             proposed_schedule: None,
+                            dependencies: None,
                         }
                     }
                     crate::chain::transaction::TransactionStatus::Executed => {
@@ -2770,6 +3225,7 @@ impl Controller {
                             billed_cpu_time_us: receipt.cpu_usage_us(),
                             action_receipt_digests: VecDeque::new(),
                             proposed_schedule: None,
+                            dependencies: None,
                         }
                     }
                     crate::chain::transaction::TransactionStatus::Delayed => {
@@ -2779,11 +3235,7 @@ impl Controller {
                         )));
                     }
                 };
-                let reproduced = TransactionReceipt::for_id(
-                    result.trace.receipt.clone(),
-                    *receipt.transaction_id(),
-                );
-                (result, reproduced)
+                (result, receipt.clone())
             } else {
                 let transaction = receipt.packed_trx().ok_or_else(|| {
                     ChainError::BlockError(format!(
@@ -2798,13 +3250,34 @@ impl Controller {
                     block_status,
                     Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
                 )?;
-                let reproduced =
-                    TransactionReceipt::new(result.trace.receipt.clone(), transaction.clone());
-                (result, reproduced)
+                (result, receipt.clone())
             };
 
+            if let Some(started) = transaction_started {
+                super::replay_profile::record_transaction("canonical", started.elapsed());
+            }
+
+            if &result.trace.receipt.status != receipt.status()
+                || result.trace.receipt.cpu_usage_us != receipt.cpu_usage_us()
+                || result.trace.receipt.net_usage_words.0 != receipt.net_usage_words()
+            {
+                return Err(ChainError::BlockError(format!(
+                    "replayed transaction receipt {} differs from the source header",
+                    receipt.transaction_id()
+                )));
+            }
+
             // Add trace to traces
-            transaction_traces.push(result.trace.clone());
+            if collect_transaction_traces {
+                transaction_traces.push(result.trace.clone());
+            }
+            if *PARALLEL_WAVE_TELEMETRY_ENABLED {
+                if let Some(dependencies) = result.dependencies.clone() {
+                    dependency_reports.push(dependencies);
+                } else {
+                    untracked_transactions += 1;
+                }
+            }
             transaction_receipts.push_back(reproduced_receipt);
             action_receipt_digests.extend(result.action_receipt_digests);
             if result.proposed_schedule.is_some() {
@@ -2818,11 +3291,51 @@ impl Controller {
                 }
             }
         }
+        let transactions_elapsed =
+            transactions_started.map_or(Duration::ZERO, |started| started.elapsed());
 
+        let flush_started = replay_profiling.then(Instant::now);
+        xpr_bot_oracle_cache.flush(&mut self.db, *block.timestamp())?;
+        let flush_elapsed = flush_started.map_or(Duration::ZERO, |started| started.elapsed());
+
+        if *PARALLEL_WAVE_TELEMETRY_ENABLED && !block.transactions.is_empty() {
+            let estimate = estimate_parallel_waves(&dependency_reports);
+            info!(
+                "parallel wave telemetry block={} transactions={} tracked={} untracked={} waves={} max_width={} conflict_pairs={}",
+                block.block_num(),
+                block.transactions.len(),
+                estimate.transactions,
+                untracked_transactions,
+                estimate.waves,
+                estimate.max_width,
+                estimate.conflict_pairs,
+            );
+        }
+
+        let merkle_started = replay_profiling.then(Instant::now);
         let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
         let action_mroot = self.calculate_action_merkle(&mut action_receipt_digests)?;
+        let merkle_elapsed = merkle_started.map_or(Duration::ZERO, |started| started.elapsed());
 
+        let resources_started = replay_profiling.then(Instant::now);
         self.finalize_block_resources(block.block_num())?;
+        let resources_elapsed =
+            resources_started.map_or(Duration::ZERO, |started| started.elapsed());
+
+        if let Some(started) = block_profile_started {
+            super::replay_profile::record_block(
+                block.block_num(),
+                super::replay_profile::BlockTiming {
+                    total: started.elapsed(),
+                    expired: expired_elapsed,
+                    onblock: onblock_elapsed,
+                    transactions: transactions_elapsed,
+                    native_flush: flush_elapsed,
+                    merkle: merkle_elapsed,
+                    resources: resources_elapsed,
+                },
+            );
+        }
 
         Ok((
             transaction_traces,
@@ -3148,14 +3661,15 @@ impl Controller {
         skip_authorization: bool,
         is_deferred: bool,
     ) -> Result<TransactionResult, ChainError> {
-        let (mut execution_db, dependency_tracker) = if *DEPENDENCY_TELEMETRY_ENABLED {
-            let (database, tracker) = self.db.clone_with_dependency_tracking();
-            (database, Some(tracker))
-        } else {
-            (self.db.clone(), None)
-        };
+        let (mut execution_db, dependency_tracker) =
+            if *DEPENDENCY_TELEMETRY_ENABLED || *PARALLEL_WAVE_TELEMETRY_ENABLED {
+                let (database, tracker) = self.db.clone_with_dependency_tracking();
+                (database, Some(tracker))
+            } else {
+                (self.db.clone(), None)
+            };
 
-        let execution = (|| {
+        let mut execution = (|| {
             let signed_transaction = packed_transaction.get_signed_transaction();
 
             // Verify basic transaction validity
@@ -3210,6 +3724,8 @@ impl Controller {
                     &trx,
                     pending_block_timestamp.clone().into(),
                 )?;
+            } else if explicit_billed.is_some() {
+                trx_context.init_for_input_trx_from_block(&trx)?;
             } else {
                 trx_context.init_for_input_trx(
                     packed_transaction.get_unprunable_size()?,
@@ -3217,12 +3733,26 @@ impl Controller {
                     &trx,
                 )?;
             }
-            trx_context.exec(&trx)?;
+            let executed_directly = if explicit_billed.is_some() && !is_deferred {
+                trx_context.try_exec_xpr_bot_direct(&trx)?
+            } else {
+                false
+            };
+            if !executed_directly {
+                // A canonical transaction may change any authority object. The
+                // replay-only inline cache may span audited native transactions,
+                // but it must never span this fallback boundary.
+                trx_context.clear_xpr_inline_authorization_cache();
+                trx_context.exec(&trx)?;
+            }
             trx_context.finalize()
         })();
 
         if let Some(tracker) = dependency_tracker {
             let report = tracker.snapshot();
+            if let Ok(result) = &mut execution {
+                result.dependencies = Some(report.clone());
+            }
             let block_num = execution.as_ref().map_or_else(
                 |_| self.last_accepted_block().block_num() + 1,
                 |result| result.trace.block_num,
@@ -3232,19 +3762,21 @@ impl Controller {
             // records. Emit the requested report at info so operators do not
             // need to weaken the global log filter (and flood the replay with
             // unrelated debug output) to measure conflict rates.
-            info!(
-                "dependency telemetry block={} trx={} success={} complete={} exact_reads={} range_reads={} writes={} read_keys={:?} ranges={:?} write_keys={:?}",
-                block_num,
-                packed_transaction.id(),
-                execution.is_ok(),
-                report.is_complete(),
-                report.exact_read_count(),
-                report.range_read_count(),
-                report.write_count(),
-                report.exact_reads(),
-                report.range_reads(),
-                report.writes(),
-            );
+            if *DEPENDENCY_TELEMETRY_ENABLED {
+                info!(
+                    "dependency telemetry block={} trx={} success={} complete={} exact_reads={} range_reads={} writes={} read_keys={:?} ranges={:?} write_keys={:?}",
+                    block_num,
+                    packed_transaction.id(),
+                    execution.is_ok(),
+                    report.is_complete(),
+                    report.exact_read_count(),
+                    report.range_read_count(),
+                    report.write_count(),
+                    report.exact_reads(),
+                    report.range_reads(),
+                    report.writes(),
+                );
+            }
         }
 
         execution
@@ -3650,6 +4182,97 @@ impl Controller {
         sync_directory(dir).map_err(|error| {
             ChainError::InternalError(format!("accept: sync schedule directory: {error}"))
         })
+    }
+
+    /// Persist the small amount of accepted header state that is not stored in
+    /// the Arena tables. This is restricted to an idle bulk-migration
+    /// controller and is installed only after the caller has made the matching
+    /// Arena revision and accepted logs durable.
+    #[doc(hidden)]
+    pub fn persist_migration_header_state(&self) -> Result<(), ChainError> {
+        let config = self
+            .node_config
+            .as_ref()
+            .ok_or_else(|| ChainError::InternalError("controller is not initialized".into()))?;
+        if config.state_history_enabled {
+            return Err(ChainError::InternalError(
+                "migration header state is restricted to bulk replay".into(),
+            ));
+        }
+        if !self.pending_chain.is_empty() {
+            return Err(ChainError::InternalError(
+                "cannot persist migration header state with pending blocks".into(),
+            ));
+        }
+        let revision = u32::try_from(self.db.revision()).map_err(|_| {
+            ChainError::InternalError("Arena revision is outside the block-height range".into())
+        })?;
+        if revision != self.last_accepted_block.block_num() {
+            return Err(ChainError::fatal_consistency(format!(
+                "Arena revision {revision} differs from accepted block {}",
+                self.last_accepted_block.block_num()
+            )));
+        }
+        let state = MigrationHeaderState {
+            revision,
+            block_id: self.last_accepted_block_id,
+            schedule_state: ProducerScheduleState {
+                active: self.active_schedule.clone(),
+                pending: self.pending_schedule.clone(),
+            },
+            signing_state: self.header_signing_state.clone(),
+        };
+        let bytes = encode_migration_header_state(&state)?;
+        let dir = Path::new(self.db_path.as_deref().ok_or_else(|| {
+            ChainError::InternalError("migration header state has no database path".into())
+        })?);
+        let target = dir.join(MIGRATION_HEADER_STATE_FILE);
+        let mut temp = tempfile::NamedTempFile::new_in(dir).map_err(|error| {
+            ChainError::InternalError(format!("create migration header state temp file: {error}"))
+        })?;
+        temp.write_all(&bytes).map_err(|error| {
+            ChainError::InternalError(format!("write migration header state: {error}"))
+        })?;
+        temp.as_file().sync_all().map_err(|error| {
+            ChainError::InternalError(format!("sync migration header state: {error}"))
+        })?;
+        temp.persist(&target).map_err(|error| {
+            ChainError::InternalError(format!(
+                "install migration header state at {}: {}",
+                target.display(),
+                error.error
+            ))
+        })?;
+        sync_directory(dir).map_err(|error| {
+            ChainError::InternalError(format!("sync migration header state directory: {error}"))
+        })
+    }
+
+    fn load_migration_header_state(
+        db_path: &str,
+        revision: u32,
+        block_id: Id,
+    ) -> Result<Option<MigrationHeaderState>, ChainError> {
+        let path = Path::new(db_path).join(MIGRATION_HEADER_STATE_FILE);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(ChainError::DatabaseError(format!(
+                    "read migration header state {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let state = decode_migration_header_state(&bytes)?;
+        if state.revision != revision || state.block_id != block_id {
+            warn!(
+                "ignoring stale migration header state at revision {} block {} (Arena revision {revision} block {block_id})",
+                state.revision, state.block_id
+            );
+            return Ok(None);
+        }
+        Ok(Some(state))
     }
 
     fn load_synced_schedule(db_path: &str) -> Result<Option<ProducerSchedule>, ChainError> {
@@ -4124,6 +4747,61 @@ mod tests {
         tempfile::tempdir().expect("failed to create temp dir")
     }
 
+    #[test]
+    fn migration_header_state_round_trips_and_rejects_corruption() {
+        let key = PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")
+            .unwrap()
+            .get_public_key();
+        let active = ProducerSchedule {
+            version: 7,
+            producers: vec![ProducerKey {
+                producer_name: Name::from_str("eosio").unwrap(),
+                block_signing_key: key.clone(),
+            }],
+        };
+        let pending = ProducerSchedule {
+            version: 8,
+            producers: vec![ProducerKey {
+                producer_name: Name::from_str("producer").unwrap(),
+                block_signing_key: key,
+            }],
+        };
+        let state = MigrationHeaderState {
+            revision: 42,
+            block_id: Id::new([9; 32]),
+            schedule_state: ProducerScheduleState {
+                active: active.clone(),
+                pending: Some(pending.clone()),
+            },
+            signing_state: HeaderSigningState {
+                blockroot_merkle: IncrementalBlockMerkle {
+                    active_nodes: vec![Digest([1; 32]), Digest([2; 32])],
+                    node_count: 42,
+                },
+                pending_schedule_hash: Digest([3; 32]),
+            },
+        };
+
+        let bytes = encode_migration_header_state(&state).unwrap();
+        let decoded = decode_migration_header_state(&bytes).unwrap();
+        assert_eq!(decoded.revision, 42);
+        assert_eq!(decoded.block_id, state.block_id);
+        assert_eq!(decoded.schedule_state.active, active);
+        assert_eq!(decoded.schedule_state.pending, Some(pending));
+        assert_eq!(
+            decoded.signing_state.blockroot_merkle.active_nodes,
+            state.signing_state.blockroot_merkle.active_nodes
+        );
+        assert_eq!(
+            decoded.signing_state.pending_schedule_hash,
+            state.signing_state.pending_schedule_hash
+        );
+
+        let mut corrupted = bytes;
+        corrupted[12] ^= 1;
+        assert!(decode_migration_header_state(&corrupted).is_err());
+    }
+
     fn generate_genesis(private_key: &PrivateKey) -> Vec<u8> {
         let genesis = json!(
         {
@@ -4310,7 +4988,7 @@ mod tests {
         // accepts setabi bytes opaquely and Mainnet contains such a payload.
         let opaque_abi = vec![0xff, 0x00, 0x01];
         let timestamp = *controller.last_accepted_block().timestamp();
-        controller.execute_transaction(
+        let result = controller.execute_transaction(
             &set_abi(&private_key, PULSE_NAME, opaque_abi.clone(), chain_id)?,
             &timestamp,
             &BlockStatus::Building,
@@ -4327,8 +5005,88 @@ mod tests {
             before_metadata.abi_sequence + 1
         );
         assert_eq!(
+            result.trace.action_traces[0]
+                .receipt
+                .as_ref()
+                .expect("setabi action has a receipt")
+                .abi_sequence
+                .0,
+            (before_metadata.abi_sequence + 1) as u32
+        );
+        assert_eq!(
             db.get_account_ram_usage(PULSE_NAME.as_u64())?,
             before_ram + opaque_abi.len() as i64 - before_abi.len() as i64
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_setcode_receipt_uses_post_execution_sequence() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let db = controller.database();
+        let before = db
+            .arena_account_metadata(PULSE_NAME.as_u64())
+            .expect("system account metadata exists");
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "apply") (param i64 i64 i64)))"#,
+        )
+        .expect("valid wasm");
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let result = controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &timestamp,
+            &BlockStatus::Building,
+        )?;
+
+        let after = db
+            .arena_account_metadata(PULSE_NAME.as_u64())
+            .expect("system account metadata still exists");
+        assert_eq!(after.code_sequence, before.code_sequence + 1);
+        assert_eq!(
+            result.trace.action_traces[0]
+                .receipt
+                .as_ref()
+                .expect("setcode action has a receipt")
+                .code_sequence
+                .0,
+            after.code_sequence as u32
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forward_setcode_executes_the_newly_installed_code() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        controller.db.preactivate_protocol_feature(
+            crate::chain::apply_context::FORWARD_SETCODE_FEATURE_DIGEST,
+        )?;
+        controller.db.activate_protocol_features(
+            &[crate::chain::apply_context::FORWARD_SETCODE_FEATURE_DIGEST],
+            1,
+        )?;
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "env" "eosio_assert" (func $assert (param i32 i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 8) "forwarded\00")
+                (func (export "apply") (param i64 i64 i64)
+                    (call $assert (i32.const 0) (i32.const 8))))"#,
+        )
+        .expect("valid wasm");
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let error = match controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &timestamp,
+            &BlockStatus::Building,
+        ) {
+            Ok(_) => panic!("FORWARD_SETCODE must execute the newly installed contract"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("forwarded"),
+            "unexpected setcode execution error: {error}"
         );
         Ok(())
     }

@@ -28,6 +28,7 @@ use pulsevm_arena::{
     IndexedBy,
     ObjectId,
     SecondaryIndex,
+    hash_index,
     key_index,
 };
 use zerocopy::{
@@ -167,7 +168,7 @@ impl UsageAccumulator {
 #[arena(type_id = 16)]
 struct ResourceUsageRow {
     id: ObjectId<ResourceUsageRow>,
-    #[arena(index)]
+    #[arena(hash_index)]
     owner: u64,
     ram_usage: u64,
     net_usage: UsageAccumulator,
@@ -198,6 +199,13 @@ impl IndexedBy<ResourceLimitsRow> for LimitsByOwner {
         (o.pending, o.owner)
     }
 }
+struct LimitsByOwnerHash;
+impl IndexedBy<ResourceLimitsRow> for LimitsByOwnerHash {
+    type Key = (u8, u64);
+    fn key(o: &ResourceLimitsRow) -> Self::Key {
+        (o.pending, o.owner)
+    }
+}
 impl ArenaObject for ResourceLimitsRow {
     const TYPE_ID: u16 = 17;
     fn id(&self) -> ObjectId<Self> {
@@ -207,7 +215,10 @@ impl ArenaObject for ResourceLimitsRow {
         self.id = id;
     }
     fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
-        vec![key_index::<Self, LimitsByOwner>()]
+        vec![
+            key_index::<Self, LimitsByOwner>(),
+            hash_index::<Self, LimitsByOwnerHash>(),
+        ]
     }
 }
 
@@ -430,6 +441,13 @@ impl IndexedBy<PermissionRow> for PermByOwner {
         (o.owner, o.perm_name)
     }
 }
+struct PermByOwnerHash;
+impl IndexedBy<PermissionRow> for PermByOwnerHash {
+    type Key = (u64, u64);
+    fn key(o: &PermissionRow) -> Self::Key {
+        (o.owner, o.perm_name)
+    }
+}
 struct PermByName;
 impl IndexedBy<PermissionRow> for PermByName {
     type Key = (u64, i64);
@@ -456,6 +474,7 @@ impl ArenaObject for PermissionRow {
         vec![
             key_index::<Self, PermByParent>(),
             key_index::<Self, PermByOwner>(),
+            hash_index::<Self, PermByOwnerHash>(),
             key_index::<Self, PermByName>(),
             key_index::<Self, PermByCbId>(),
         ]
@@ -1345,6 +1364,17 @@ pub struct ChainDatabase {
     inner: Arc<RwLock<Db>>,
 }
 
+/// One replay-coalesced primary-row rewrite. Values are owned because the
+/// caller accumulates them outside the Arena lock until the block boundary.
+pub struct ContractRowUpdate {
+    pub code: u64,
+    pub scope: u64,
+    pub table: u64,
+    pub primary_key: u64,
+    pub payer: u64,
+    pub value: Vec<u8>,
+}
+
 /// Builds an empty `Db` with every chain table registered. Shared by
 /// `ChainDatabase::new` and the restart path so both agree on the table set.
 fn build_registered_db() -> Result<Db, DbError> {
@@ -1779,6 +1809,110 @@ impl ChainDatabase {
         Ok(bumped)
     }
 
+    /// Advance every counter used to construct one action receipt under a
+    /// single database lock. The ordinary helpers acquire the same lock once
+    /// for the global sequence, once for the receiver, and twice per authority
+    /// (increment then read); dense replay spends more time routing those tiny
+    /// mutations than changing the rows themselves.
+    pub fn next_action_sequences(
+        &self,
+        receiver: u64,
+        auth_actors: &[u64],
+    ) -> Result<Option<(u64, u64, Vec<u64>)>, DbError> {
+        let mut db = self.lock();
+
+        let global = db
+            .table::<DynGlobalPropertyRow>()?
+            .iter()
+            .next()
+            .map(|row| (row.id(), row.global_action_sequence));
+        let next_global = global.map_or(Ok(1), |(_, value)| {
+            value
+                .checked_add(1)
+                .ok_or_else(|| DbError::Corrupted("global action sequence overflow".into()))
+        })?;
+        match global {
+            Some((id, _)) => db.modify::<DynGlobalPropertyRow>(id, |row| {
+                row.global_action_sequence = next_global;
+            })?,
+            None => {
+                db.create::<DynGlobalPropertyRow>(|row| {
+                    row.global_action_sequence = next_global;
+                })?;
+            }
+        }
+
+        let Some((receiver_id, next_recv)) = db
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&receiver)?
+            .map(|row| (row.id(), row.recv_sequence.wrapping_add(1)))
+        else {
+            return Ok(None);
+        };
+        db.modify::<AccountMetaRow>(receiver_id, |row| {
+            row.recv_sequence = next_recv;
+        })?;
+
+        let mut auth_sequences = Vec::with_capacity(auth_actors.len());
+        for actor in auth_actors {
+            let Some((id, next_auth)) = db
+                .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(actor)?
+                .map(|row| (row.id(), row.auth_sequence.wrapping_add(1)))
+            else {
+                return Ok(None);
+            };
+            db.modify::<AccountMetaRow>(id, |row| {
+                row.auth_sequence = next_auth;
+            })?;
+            auth_sequences.push(next_auth);
+        }
+
+        Ok(Some((next_global, next_recv, auth_sequences)))
+    }
+
+    /// Materialize replay-coalesced action-receipt counters under one Arena
+    /// lock while preserving every unrelated account-metadata field.
+    pub fn set_action_sequences(
+        &self,
+        global_sequence: u64,
+        accounts: &[(u64, u64, u64)],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let global_id = db
+            .table::<DynGlobalPropertyRow>()?
+            .iter()
+            .next()
+            .map(|row| row.id());
+        let mut resolved = Vec::with_capacity(accounts.len());
+        for &(name, recv_sequence, auth_sequence) in accounts {
+            let id = db
+                .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)?
+                .map(|row| row.id())
+                .ok_or_else(|| {
+                    DbError::Corrupted(format!(
+                        "account metadata missing while flushing receipt sequences for {name}"
+                    ))
+                })?;
+            resolved.push((id, recv_sequence, auth_sequence));
+        }
+        match global_id {
+            Some(id) => db.modify::<DynGlobalPropertyRow>(id, |row| {
+                row.global_action_sequence = global_sequence;
+            })?,
+            None => {
+                db.create::<DynGlobalPropertyRow>(|row| {
+                    row.global_action_sequence = global_sequence;
+                })?;
+            }
+        }
+        for (id, recv_sequence, auth_sequence) in resolved {
+            db.modify::<AccountMetaRow>(id, |row| {
+                row.recv_sequence = recv_sequence;
+                row.auth_sequence = auth_sequence;
+            })?;
+        }
+        Ok(())
+    }
+
     /// Mirrors `update_account_abi`: bumps the account_metadata abi_sequence and
     /// reassigns the account_object abi blob. Both rows are located by the name
     /// recovered from the metadata object's get_name accessor.
@@ -1887,7 +2021,10 @@ impl ChainDatabase {
     /// object intentionally aliases.
     pub fn reserve_permission_zero(&self) -> Result<(), DbError> {
         let mut db = self.lock();
-        if db.find_by::<PermissionRow, PermByOwner>(&(0, 0))?.is_none() {
+        if db
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(0, 0))?
+            .is_none()
+        {
             db.create::<PermissionRow>(|permission| {
                 permission.cb_id = 0;
                 permission.usage_id = 0;
@@ -1948,7 +2085,7 @@ impl ChainDatabase {
     ) -> Result<(), DbError> {
         let mut db = self.lock();
         let id = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))?
             .map(|p| p.id());
         let Some(id) = id else { return Ok(()) };
         let auth_blob = db.alloc_blob::<PermissionRow>(auth)?;
@@ -1973,7 +2110,7 @@ impl ChainDatabase {
     ) -> Result<(), DbError> {
         let mut db = self.lock();
         let found = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))?
             .map(|permission| (permission.id(), permission.auth));
         let (id, old_auth) = found.ok_or_else(|| {
             DbError::Corrupted(format!(
@@ -1991,7 +2128,7 @@ impl ChainDatabase {
     /// Consensus timestamp recorded on the permission row.
     pub fn permission_last_updated(&self, owner: u64, perm_name: u64) -> Option<i64> {
         let db = self.read();
-        db.find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
+        db.find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))
             .ok()
             .flatten()
             .map(|permission| permission.last_updated)
@@ -2003,7 +2140,7 @@ impl ChainDatabase {
     pub fn permission(&self, owner: u64, perm_name: u64) -> Option<(i64, u32)> {
         let db = self.read();
         let (parent, auth) = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))
             .ok()
             .flatten()
             .map(|p| (p.parent, p.auth))?;
@@ -2054,7 +2191,7 @@ impl ChainDatabase {
     /// the arena. `None` if the permission is absent.
     pub fn permission_cb_id(&self, owner: u64, perm_name: u64) -> Option<i64> {
         let db = self.read();
-        db.find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
+        db.find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))
             .ok()
             .flatten()
             .map(|p| p.cb_id)
@@ -2067,7 +2204,7 @@ impl ChainDatabase {
     pub fn permission_last_used(&self, owner: u64, perm_name: u64) -> Option<i64> {
         let db = self.read();
         let usage_id = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))
             .ok()
             .flatten()
             .map(|p| p.usage_id)?;
@@ -2083,7 +2220,7 @@ impl ChainDatabase {
     pub fn permission_auth_blob(&self, owner: u64, perm_name: u64) -> Option<Vec<u8>> {
         let db = self.read();
         let auth = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))
             .ok()
             .flatten()
             .map(|p| p.auth)?;
@@ -2104,12 +2241,12 @@ impl ChainDatabase {
     ) -> Option<bool> {
         let db = self.read();
         let (a_owner, a_id) = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner_a, name_a))
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner_a, name_a))
             .ok()
             .flatten()
             .map(|p| (p.owner, p.cb_id))?;
         let (b_owner, b_id, b_parent) = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner_b, name_b))
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner_b, name_b))
             .ok()
             .flatten()
             .map(|p| (p.owner, p.cb_id, p.parent))?;
@@ -2209,7 +2346,7 @@ impl ChainDatabase {
             let auth = &bytes[pos..pos + auth_len];
             pos += auth_len;
             if db
-                .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+                .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))?
                 .is_some()
             {
                 continue;
@@ -2365,7 +2502,7 @@ impl ChainDatabase {
             let net = read_acc(&c[16..36]);
             let cpu = read_acc(&c[36..56]);
             if let Some(id) = db
-                .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
+                .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
                 .map(|row| row.id())
             {
                 db.modify::<ResourceUsageRow>(id, |r| {
@@ -2418,7 +2555,7 @@ impl ChainDatabase {
             let net = u64::from_le_bytes(c[17..25].try_into().unwrap()) as i64;
             let cpu = u64::from_le_bytes(c[25..33].try_into().unwrap()) as i64;
             if let Some(id) = db
-                .find_by::<ResourceLimitsRow, LimitsByOwner>(&(pending, owner))?
+                .find_by_hash::<ResourceLimitsRow, LimitsByOwnerHash>(&(pending, owner))?
                 .map(|row| row.id())
             {
                 db.modify::<ResourceLimitsRow>(id, |r| {
@@ -2538,7 +2675,7 @@ impl ChainDatabase {
     pub fn remove_permission(&self, owner: u64, perm_name: u64) -> Result<(), DbError> {
         let mut db = self.lock();
         let found = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))?
             .map(|p| (p.id(), p.usage_id));
         let Some((id, usage_id)) = found else {
             return Ok(());
@@ -2556,7 +2693,7 @@ impl ChainDatabase {
     ) -> Result<(), DbError> {
         let mut db = self.lock();
         let usage_id = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))?
             .map(|p| p.usage_id);
         let Some(usage_id) = usage_id else {
             return Ok(());
@@ -2583,7 +2720,7 @@ impl ChainDatabase {
         }
         let mut db = self.lock();
         let usage_id = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))?
             .map(|row| row.usage_id)
             .ok_or_else(|| DbError::Corrupted("permission sidecar row is missing".into()))?;
         db.modify::<PermissionUsageRow>(ObjectId::new(usage_id), |row| {
@@ -2699,13 +2836,13 @@ impl ChainDatabase {
     ) -> Result<(), DbError> {
         let mut db = self.lock();
         let pending = db
-            .find_by::<ResourceLimitsRow, LimitsByOwner>(&(1u8, account))?
+            .find_by_hash::<ResourceLimitsRow, LimitsByOwnerHash>(&(1u8, account))?
             .map(|r| r.id());
         let id = match pending {
             Some(id) => id,
             None => {
                 let actual = db
-                    .find_by::<ResourceLimitsRow, LimitsByOwner>(&(0u8, account))?
+                    .find_by_hash::<ResourceLimitsRow, LimitsByOwnerHash>(&(0u8, account))?
                     .map(|r| (r.ram_bytes, r.net_weight, r.cpu_weight));
                 let Some((a_ram, a_net, a_cpu)) = actual else {
                     return Ok(());
@@ -2759,7 +2896,7 @@ impl ChainDatabase {
         };
         for (pending_id, owner, ram_bytes, net_weight, cpu_weight) in pendings {
             let actual = db
-                .find_by::<ResourceLimitsRow, LimitsByOwner>(&(0u8, owner))?
+                .find_by_hash::<ResourceLimitsRow, LimitsByOwnerHash>(&(0u8, owner))?
                 .map(|r| (r.id(), r.ram_bytes, r.net_weight, r.cpu_weight));
             if let Some((actual_id, old_ram, old_net, old_cpu)) = actual {
                 db.modify::<ResourceLimitsRow>(actual_id, |r| {
@@ -2786,13 +2923,13 @@ impl ChainDatabase {
     pub fn account_limits(&self, account: u64) -> Option<(i64, i64, i64)> {
         let db = self.read();
         if let Some(r) = db
-            .find_by::<ResourceLimitsRow, LimitsByOwner>(&(1u8, account))
+            .find_by_hash::<ResourceLimitsRow, LimitsByOwnerHash>(&(1u8, account))
             .ok()
             .flatten()
         {
             return Some((r.ram_bytes, r.net_weight, r.cpu_weight));
         }
-        db.find_by::<ResourceLimitsRow, LimitsByOwner>(&(0u8, account))
+        db.find_by_hash::<ResourceLimitsRow, LimitsByOwnerHash>(&(0u8, account))
             .ok()
             .flatten()
             .map(|r| (r.ram_bytes, r.net_weight, r.cpu_weight))
@@ -2821,7 +2958,7 @@ impl ChainDatabase {
         let state = db.table::<ResourceStateRow>().ok()?.iter().next()?;
         let cfg = db.table::<ResourceConfigRow>().ok()?.iter().next()?;
         let usage = db
-            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&account)
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&account)
             .ok()
             .flatten()?
             .net_usage;
@@ -2858,7 +2995,7 @@ impl ChainDatabase {
         let state = db.table::<ResourceStateRow>().ok()?.iter().next()?;
         let cfg = db.table::<ResourceConfigRow>().ok()?.iter().next()?;
         let usage = db
-            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&account)
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&account)
             .ok()
             .flatten()?
             .cpu_usage;
@@ -2871,6 +3008,67 @@ impl ChainDatabase {
             usage,
             greylist_limit,
             current_slot,
+        ))
+    }
+
+    /// Gather every immutable input needed to validate and apply one account
+    /// usage update under a single Arena read lock. The tuple is
+    /// `(net_window, cpu_window, net_available, cpu_available,
+    /// block_cpu_available, block_net_available)`.
+    pub fn account_usage_context(
+        &self,
+        account: u64,
+        greylist_limit: u32,
+    ) -> Option<(u32, u32, i64, i64, u64, u64)> {
+        let db = self.read();
+        let limits = db.table::<ResourceLimitsRow>().ok()?;
+        let effective = limits
+            .get_index::<LimitsByOwner>()
+            .get(&(1u8, account))
+            .ok()
+            .or_else(|| {
+                limits
+                    .get_index::<LimitsByOwner>()
+                    .get(&(0u8, account))
+                    .ok()
+            })?;
+        let state = db.table::<ResourceStateRow>().ok()?.iter().next()?;
+        let cfg = db.table::<ResourceConfigRow>().ok()?.iter().next()?;
+        let usage = db
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&account)
+            .ok()
+            .flatten()?;
+        let net = elastic_account_limit_info(
+            effective.net_weight,
+            state.total_net_weight,
+            state.virtual_net_limit,
+            cfg.account_net_usage_average_window,
+            cfg.net_max,
+            usage.net_usage,
+            greylist_limit,
+            None,
+        )
+        .0
+        .available;
+        let cpu = elastic_account_limit_info(
+            effective.cpu_weight,
+            state.total_cpu_weight,
+            state.virtual_cpu_limit,
+            cfg.account_cpu_usage_average_window,
+            cfg.cpu_max,
+            usage.cpu_usage,
+            greylist_limit,
+            None,
+        )
+        .0
+        .available;
+        Some((
+            cfg.account_net_usage_average_window,
+            cfg.account_cpu_usage_average_window,
+            net,
+            cpu,
+            cfg.cpu_max.saturating_sub(state.pending_cpu_usage),
+            cfg.net_max.saturating_sub(state.pending_net_usage),
         ))
     }
 
@@ -3095,7 +3293,7 @@ impl ChainDatabase {
         }
         let mut db = self.lock();
         let id = db
-            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
             .map(|r| r.id());
         if let Some(id) = id {
             db.modify::<ResourceUsageRow>(id, |r| {
@@ -3109,7 +3307,7 @@ impl ChainDatabase {
     /// chainbase's `get_account_ram_usage`.
     pub fn account_ram_usage(&self, owner: u64) -> Option<u64> {
         self.read()
-            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
             .ok()
             .flatten()
             .map(|r| r.ram_usage)
@@ -3129,7 +3327,7 @@ impl ChainDatabase {
     ) -> Result<(), DbError> {
         let mut db = self.lock();
         let id = db
-            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
             .map(|r| r.id())
             .ok_or_else(|| {
                 DbError::Corrupted(format!("resource usage row is missing for account {owner}"))
@@ -3137,6 +3335,43 @@ impl ChainDatabase {
         db.modify::<ResourceUsageRow>(id, |r| {
             r.net_usage.add(net_usage, time_slot, net_window);
             r.cpu_usage.add(cpu_usage, time_slot, cpu_window);
+        })?;
+        Ok(())
+    }
+
+    /// Apply account and containing-block usage in one write critical section.
+    /// This is arithmetically identical to `add_transaction_usage` followed by
+    /// `add_block_usage`, but avoids releasing and reacquiring the Arena lock on
+    /// every accepted transaction.
+    pub fn add_transaction_and_block_usage(
+        &self,
+        owner: u64,
+        cpu_usage: u64,
+        net_usage: u64,
+        time_slot: u32,
+        net_window: u32,
+        cpu_window: u32,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let usage_id = db
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
+            .map(|row| row.id())
+            .ok_or_else(|| {
+                DbError::Corrupted(format!("resource usage row is missing for account {owner}"))
+            })?;
+        let state_id = db
+            .table::<ResourceStateRow>()?
+            .iter()
+            .next()
+            .map(|state| state.id())
+            .ok_or_else(|| DbError::Corrupted("resource state row is missing".into()))?;
+        db.modify::<ResourceUsageRow>(usage_id, |row| {
+            row.net_usage.add(net_usage, time_slot, net_window);
+            row.cpu_usage.add(cpu_usage, time_slot, cpu_window);
+        })?;
+        db.modify::<ResourceStateRow>(state_id, |state| {
+            state.pending_cpu_usage += cpu_usage;
+            state.pending_net_usage += net_usage;
         })?;
         Ok(())
     }
@@ -3157,7 +3392,7 @@ impl ChainDatabase {
     /// `owner` — for exact diffing against chainbase.
     pub fn account_net_usage_value_ex(&self, owner: u64) -> Option<u64> {
         self.read()
-            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
             .ok()
             .flatten()
             .map(|r| r.net_usage.value_ex)
@@ -3167,7 +3402,7 @@ impl ChainDatabase {
     /// chainbase.
     pub fn account_cpu_usage_value_ex(&self, owner: u64) -> Option<u64> {
         self.read()
-            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
             .ok()
             .flatten()
             .map(|r| r.cpu_usage.value_ex)
@@ -5157,6 +5392,51 @@ impl ChainDatabase {
             db.modify::<ContractKeyValueRow>(id, |k| {
                 k.value = blob;
                 k.payer = payer;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Apply replay-coalesced contract row rewrites under one Arena lock. Every
+    /// key is resolved before the first mutation so a stale cache cannot leave
+    /// a partially applied batch.
+    pub fn update_key_value_objects(&self, updates: &[ContractRowUpdate]) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let mut resolved = Vec::with_capacity(updates.len());
+        for update in updates {
+            let Some(t_id) = db
+                .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(
+                    update.code,
+                    update.scope,
+                    update.table,
+                ))?
+                .map(|row| row.id().raw())
+            else {
+                return Err(DbError::Corrupted(format!(
+                    "replay update references missing contract table ({}, {}, {})",
+                    update.code, update.scope, update.table
+                )));
+            };
+            let Some((id, old_value)) = db
+                .find_by::<ContractKeyValueRow, ContractKvByScopePrimary>(&(
+                    t_id,
+                    update.primary_key,
+                ))?
+                .map(|row| (row.id(), row.value))
+            else {
+                return Err(DbError::Corrupted(format!(
+                    "replay update references missing primary row {} in ({}, {}, {})",
+                    update.primary_key, update.code, update.scope, update.table
+                )));
+            };
+            resolved.push((id, old_value));
+        }
+
+        for (update, (id, old_value)) in updates.iter().zip(resolved) {
+            let blob = db.realloc_blob::<ContractKeyValueRow>(old_value, &update.value)?;
+            db.modify::<ContractKeyValueRow>(id, |row| {
+                row.value = blob;
+                row.payer = update.payer;
             })?;
         }
         Ok(())

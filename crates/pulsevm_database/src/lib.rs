@@ -35,10 +35,12 @@ pub use crate::{
         ContractRowKey,
         DependencyKey,
         DependencyTracker,
+        ParallelWaveEstimate,
         RangeDependency,
         SystemKey,
         SystemRangeKey,
         TransactionDependencies,
+        estimate_parallel_waves,
     },
     objects::{
         Index64Object,

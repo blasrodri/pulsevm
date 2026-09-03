@@ -51,12 +51,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(hex::encode)
             .unwrap_or_else(|| "unavailable".into())
     );
-    for (table, bytes) in database.arena_state_table_bytes() {
+
+    if let Some(path) = env::var_os("XPR_DUMP_SHIP_SNAPSHOT") {
+        let bytes = database.pack_deltas(true, &[0; 32]);
+        fs::write(&path, &bytes)?;
         println!(
-            "table={table} bytes={} sha256={}",
+            "ship_snapshot bytes={} sha256={} output={}",
             bytes.len(),
-            hex::encode(Sha256::digest(&bytes))
+            hex::encode(Sha256::digest(&bytes)),
+            PathBuf::from(path).display(),
         );
+    }
+
+    if let Ok(spec) = env::var("XPR_DUMP_ROW") {
+        let names = spec
+            .split(',')
+            .map(str::trim)
+            .map(Name::from_str)
+            .collect::<Result<Vec<_>, _>>()?;
+        if names.len() != 4 {
+            return Err("XPR_DUMP_ROW must be code,scope,table,primary".into());
+        }
+        let value = database
+            .arena_kv_get(
+                names[0].as_u64(),
+                names[1].as_u64(),
+                names[2].as_u64(),
+                names[3].as_u64(),
+            )
+            .ok_or("requested contract row is absent")?;
+        println!(
+            "row code={} scope={} table={} primary={} bytes={} hex={}",
+            names[0],
+            names[1],
+            names[2],
+            names[3],
+            value.len(),
+            hex::encode(value)
+        );
+        return Ok(());
+    }
+    if let Ok(spec) = env::var("XPR_DUMP_TABLE") {
+        let names = spec
+            .split(',')
+            .map(str::trim)
+            .map(Name::from_str)
+            .collect::<Result<Vec<_>, _>>()?;
+        if names.len() != 3 {
+            return Err("XPR_DUMP_TABLE must be code,scope,table".into());
+        }
+        let (code, scope, table) = (names[0].as_u64(), names[1].as_u64(), names[2].as_u64());
+        let mut primary = database.arena_kv_lower_bound(code, scope, table, 0);
+        while let Some(key) = primary {
+            let value = database
+                .arena_kv_get(code, scope, table, key)
+                .ok_or("table iterator returned an absent row")?;
+            println!(
+                "row primary={key} bytes={} hex={}",
+                value.len(),
+                hex::encode(value)
+            );
+            primary = database.arena_kv_upper_bound(code, scope, table, key);
+        }
+        return Ok(());
+    }
+    if env::var_os("XPR_DUMP_SKIP_STATE_TABLES").is_none() {
+        for (table, bytes) in database.arena_state_table_bytes() {
+            fs::write(output_dir.join(format!("state-{table}.bin")), &bytes)?;
+            println!(
+                "table={table} bytes={} sha256={}",
+                bytes.len(),
+                hex::encode(Sha256::digest(&bytes))
+            );
+        }
     }
 
     for account_text in accounts {

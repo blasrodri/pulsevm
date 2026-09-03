@@ -611,6 +611,22 @@ fn validate_data_segment(offset_expr: &wasmparser::ConstExpr, data: &[u8]) -> Re
 /// Returns a [`ValidationError`] describing the first constraint violation
 /// found, if any.
 pub fn validate_wasm(wasm: &[u8]) -> Result<()> {
+    validate_wasm_impl(wasm, false)
+}
+
+/// Validate historical XPR code using the source chain's start-section rule.
+///
+/// XPR's WAVM validator accepts a standard start function and its runtime
+/// executes it during action initialization, immediately before `apply`.
+/// PulseVM keeps rejecting start sections for newly submitted code, but the
+/// offline migration replay must admit bytecode that the source chain already
+/// accepted.
+#[doc(hidden)]
+pub fn validate_xpr_replay_wasm(wasm: &[u8]) -> Result<()> {
+    validate_wasm_impl(wasm, true)
+}
+
+fn validate_wasm_impl(wasm: &[u8], allow_start_section: bool) -> Result<()> {
     // ---- Code size check --------------------------------------------------
     if wasm.len() > constraints::MAXIMUM_CODE_SIZE {
         return Err(ValidationError::CodeTooLarge);
@@ -772,11 +788,10 @@ pub fn validate_wasm(wasm: &[u8]) -> Result<()> {
                 }
             }
 
-            // A start section runs during instantiation, before apply is called
-            // and before the metering budget is seeded — host intrinsics reached
-            // from it would execute unbilled. EOSIO disallows start sections
-            // outright, so reject them here rather than admit unmetered work.
-            Payload::StartSection { .. } => {
+            // A start section runs during instantiation, before apply is called.
+            // Keep it disabled for ordinary PulseVM deployments. The historical
+            // XPR replay entry point mirrors XPR's validator and admits one.
+            Payload::StartSection { .. } if !allow_start_section => {
                 return Err(ValidationError::StartSectionNotAllowed);
             }
 
@@ -856,9 +871,8 @@ mod tests {
 
     #[test]
     fn test_start_section_rejected() {
-        // A start section runs during instantiation, before metering is seeded,
-        // so host intrinsics reached from it would run unbilled. It must be
-        // rejected outright (EOSIO disallows start sections).
+        // Ordinary PulseVM deployments reject start sections. Historical XPR
+        // replay has a separate validation path because XPR accepted them.
         let wasm = wat::parse_str(
             r#"
             (module
@@ -875,6 +889,7 @@ mod tests {
         .expect("valid WAT");
         let err = validate_wasm(&wasm).unwrap_err();
         assert!(matches!(err, ValidationError::StartSectionNotAllowed));
+        assert!(validate_xpr_replay_wasm(&wasm).is_ok());
     }
 
     #[test]

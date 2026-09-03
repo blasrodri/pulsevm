@@ -1,7 +1,10 @@
 #![allow(clippy::needless_return, clippy::too_many_arguments)]
 
 use std::{
-    collections::HashMap,
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     fs,
     io::{
         Read,
@@ -647,6 +650,60 @@ pub struct Database {
     /// Non-persisted capability used only by the offline XPR replay tool.
     /// Production VM construction leaves it false.
     xpr_native_replay: Arc<AtomicBool>,
+    /// Allow the offline importer to retain audited native contract writes
+    /// across accepted blocks, materializing them only before WASM fallback or
+    /// checkpoint persistence. This is never enabled by VM construction.
+    xpr_defer_native_writes: Arc<AtomicBool>,
+    /// Contract rows rewritten repeatedly by audited native handlers are held
+    /// in block-scoped overlays and applied once at commit. This is process-local
+    /// replay machinery; ordinary VM execution never enables it.
+    xpr_native_rows: Arc<Mutex<XprNativeRowCache>>,
+    /// Action-receipt counters use the same replay-only undo layers so hundreds
+    /// of actions can collapse to one account-metadata mutation per account.
+    xpr_native_sequences: Arc<Mutex<XprNativeSequenceCache>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ActionExecutionMetadata {
+    pub privileged: bool,
+    pub code_hash: [u8; 32],
+    pub vm_type: u8,
+    pub vm_version: u8,
+    pub code_sequence: u64,
+    pub abi_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct XprNativeRowKey {
+    code: u64,
+    scope: u64,
+    table: u64,
+    primary_key: u64,
+}
+
+type XprNativeRow = (u64, Vec<u8>);
+
+#[derive(Default)]
+struct XprNativeRowCache {
+    base: HashMap<XprNativeRowKey, Option<XprNativeRow>>,
+    dirty: BTreeMap<XprNativeRowKey, XprNativeRow>,
+    layers: Vec<BTreeMap<XprNativeRowKey, XprNativeRow>>,
+    inline_authorization: Option<(u64, u64, u64, u64, u64)>,
+}
+
+#[derive(Default)]
+struct XprNativeSequenceLayer {
+    global: Option<u64>,
+    accounts: BTreeMap<u64, (u64, u64)>,
+}
+
+#[derive(Default)]
+struct XprNativeSequenceCache {
+    base_global: Option<u64>,
+    base_accounts: HashMap<u64, (u64, u64)>,
+    dirty_global: Option<u64>,
+    dirty_accounts: BTreeMap<u64, (u64, u64)>,
+    layers: Vec<XprNativeSequenceLayer>,
 }
 
 /// The staged arena checkpoint file used to move a snapshot through the transport
@@ -748,6 +805,9 @@ impl Database {
             speculation_freeze: Arc::new(AtomicBool::new(false)),
             authority_cache: Arc::new(Mutex::new(HashMap::new())),
             xpr_native_replay: Arc::new(AtomicBool::new(false)),
+            xpr_defer_native_writes: Arc::new(AtomicBool::new(false)),
+            xpr_native_rows: Arc::new(Mutex::new(XprNativeRowCache::default())),
+            xpr_native_sequences: Arc::new(Mutex::new(XprNativeSequenceCache::default())),
         })
     }
 
@@ -1992,18 +2052,132 @@ impl Database {
     /// Arena undo-session lifecycle, driven by the controller's block boundaries.
     pub fn arena_start_undo_session(&self) {
         self.backend.start_undo_session();
+        if self.xpr_native_replay_enabled() {
+            self.xpr_native_rows
+                .lock()
+                .unwrap()
+                .layers
+                .push(BTreeMap::new());
+            self.xpr_native_sequences
+                .lock()
+                .unwrap()
+                .layers
+                .push(XprNativeSequenceLayer::default());
+        }
+    }
+
+    /// Add a nested undo layer for replay-only contract-row overlays without
+    /// cloning the full Arena undo state. Audited native handlers stage all row
+    /// writes here and defer any ordinary database mutations until the attempt
+    /// is known to be supported.
+    pub fn xpr_native_start_row_session(&self) -> Result<(), ChainError> {
+        if !self.xpr_native_replay_enabled() {
+            return Err(ChainError::InternalError(
+                "XPR native row session requires replay mode".into(),
+            ));
+        }
+        self.xpr_native_rows
+            .lock()
+            .unwrap()
+            .layers
+            .push(BTreeMap::new());
+        Ok(())
+    }
+
+    pub fn xpr_native_squash_row_session(&self) -> Result<(), ChainError> {
+        let mut cache = self.xpr_native_rows.lock().unwrap();
+        if cache.layers.len() < 2 {
+            return Err(ChainError::InternalError(
+                "XPR native row session has no parent".into(),
+            ));
+        }
+        let layer = cache.layers.pop().expect("length checked above");
+        cache
+            .layers
+            .last_mut()
+            .expect("parent XPR row layer exists")
+            .extend(layer);
+        Ok(())
+    }
+
+    pub fn xpr_native_undo_row_session(&self) -> Result<(), ChainError> {
+        let mut cache = self.xpr_native_rows.lock().unwrap();
+        if cache.layers.len() < 2 {
+            return Err(ChainError::InternalError(
+                "XPR native row session has no parent".into(),
+            ));
+        }
+        cache.layers.pop();
+        Ok(())
+    }
+
+    /// Cache one successful inline authority check across consecutive audited
+    /// native transactions in the same block. The controller clears this before
+    /// every canonical fallback and commit, so no transaction capable of
+    /// changing permissions can be crossed.
+    pub fn xpr_native_inline_authorization_cached(&self, key: (u64, u64, u64, u64, u64)) -> bool {
+        self.xpr_native_rows.lock().unwrap().inline_authorization == Some(key)
+    }
+
+    pub fn cache_xpr_native_inline_authorization(&self, key: (u64, u64, u64, u64, u64)) {
+        self.xpr_native_rows.lock().unwrap().inline_authorization = Some(key);
+    }
+
+    pub fn clear_xpr_native_inline_authorization(&self) {
+        if self.xpr_native_replay_enabled() {
+            self.xpr_native_rows.lock().unwrap().inline_authorization = None;
+        }
     }
     pub fn arena_squash(&self) {
         self.backend.squash();
+        if self.xpr_native_replay_enabled() {
+            let mut cache = self.xpr_native_rows.lock().unwrap();
+            // A transaction/onblock layer folds into its enclosing block. If a
+            // caller squashes the sole layer, retain the overlay until commit:
+            // the backend has no parent undo session, but its rows have not yet
+            // been materialized there.
+            if cache.layers.len() > 1 {
+                let layer = cache.layers.pop().expect("length checked above");
+                cache
+                    .layers
+                    .last_mut()
+                    .expect("outer XPR replay layer must exist")
+                    .extend(layer);
+            }
+            let mut sequences = self.xpr_native_sequences.lock().unwrap();
+            if sequences.layers.len() > 1 {
+                let layer = sequences.layers.pop().expect("length checked above");
+                let parent = sequences
+                    .layers
+                    .last_mut()
+                    .expect("outer XPR replay sequence layer must exist");
+                if layer.global.is_some() {
+                    parent.global = layer.global;
+                }
+                parent.accounts.extend(layer.accounts);
+            }
+        }
     }
     pub fn arena_undo(&self) {
         self.backend.undo();
+        if self.xpr_native_replay_enabled() {
+            let mut cache = self.xpr_native_rows.lock().unwrap();
+            cache.layers.pop();
+            cache.base.clear();
+            cache.inline_authorization = None;
+            let mut sequences = self.xpr_native_sequences.lock().unwrap();
+            sequences.layers.pop();
+            sequences.base_global = None;
+            sequences.base_accounts.clear();
+        }
     }
 
     /// The arena lives in memory behind an `Arc`, so there is nothing to close;
     /// dropping the last handle releases it. Retained for the controller's
     /// restart sequence.
     pub fn close(&self) -> Result<(), ChainError> {
+        self.flush_xpr_native_rows()?;
+        self.flush_xpr_native_sequences()?;
         // Persist the committed arena to disk so the next open reloads it, matching
         // chainbase's mapped `shared_memory.bin`. The directory may not exist yet
         // for a never-opened default database, so create it first.
@@ -2314,7 +2488,38 @@ impl Database {
     }
 
     pub fn commit(&mut self, revision: i64) -> Result<(), ChainError> {
+        self.clear_xpr_native_inline_authorization();
+        if self.xpr_deferred_native_writes_enabled() {
+            let mut cache = self.xpr_native_rows.lock().unwrap();
+            let layers = std::mem::take(&mut cache.layers);
+            for layer in layers {
+                cache.dirty.extend(layer);
+            }
+            cache.base.clear();
+            let mut sequences = self.xpr_native_sequences.lock().unwrap();
+            let layers = std::mem::take(&mut sequences.layers);
+            for layer in layers {
+                if layer.global.is_some() {
+                    sequences.dirty_global = layer.global;
+                }
+                sequences.dirty_accounts.extend(layer.accounts);
+            }
+            sequences.base_global = None;
+            sequences.base_accounts.clear();
+        } else {
+            self.flush_xpr_native_rows()?;
+            self.flush_xpr_native_sequences()?;
+        }
         self.backend.commit(revision);
+        if self.xpr_native_replay_enabled() && !self.xpr_deferred_native_writes_enabled() {
+            let mut cache = self.xpr_native_rows.lock().unwrap();
+            cache.layers.clear();
+            cache.base.clear();
+            let mut sequences = self.xpr_native_sequences.lock().unwrap();
+            sequences.layers.clear();
+            sequences.base_global = None;
+            sequences.base_accounts.clear();
+        }
         Ok(())
     }
 
@@ -3125,45 +3330,34 @@ impl Database {
         self.dependency_system_write(SystemKey::ResourceUsage(account));
         self.dependency_system_write(SystemKey::ResourceState);
 
-        let (net_window, cpu_window) =
-            self.get_account_net_usage_average_window().and_then(|nw| {
-                self.get_account_cpu_usage_average_window()
-                    .map(|cw| (nw, cw))
-            })?;
-
         let s = &self.backend;
+        let (
+            net_window,
+            cpu_window,
+            net_available,
+            cpu_available,
+            block_cpu_available,
+            block_net_available,
+        ) = s
+            .account_usage_context(account, MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER)
+            .ok_or_else(|| {
+                ChainError::InternalError(format!(
+                    "resource state not found while billing account {account}"
+                ))
+            })?;
         if validate {
-            let (net_available, _) = s
-                .account_net_limit(account, MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER)
-                .ok_or_else(|| {
-                    ChainError::InternalError(format!(
-                        "resource state not found while billing account {account}"
-                    ))
-                })?;
             if net_available >= 0 && net_usage > net_available as u64 {
                 return Err(ChainError::TransactionError(format!(
                     "transaction net usage is too high: {net_usage} > {net_available}"
                 )));
             }
 
-            let (cpu_available, _) = s
-                .account_cpu_limit(account, MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER)
-                .ok_or_else(|| {
-                    ChainError::InternalError(format!(
-                        "resource state not found while billing account {account}"
-                    ))
-                })?;
             if cpu_available >= 0 && cpu_usage > cpu_available as u64 {
                 return Err(ChainError::TransactionError(format!(
                     "transaction CPU usage is too high: {cpu_usage} > {cpu_available}"
                 )));
             }
 
-            let (block_cpu_available, block_net_available) = s.block_limits().ok_or_else(|| {
-                ChainError::InternalError(format!(
-                    "resource state not found while billing account {account}"
-                ))
-            })?;
             if cpu_usage > block_cpu_available {
                 return Err(ChainError::TransactionError(format!(
                     "block has insufficient CPU resources: {cpu_usage} > {block_cpu_available}"
@@ -3176,12 +3370,10 @@ impl Database {
             }
         }
 
-        s.add_transaction_usage(
+        s.add_transaction_and_block_usage(
             account, cpu_usage, net_usage, time_slot, net_window, cpu_window,
         )
         .map_err(|e| ChainError::InternalError(format!("arena add_transaction_usage: {e:?}")))?;
-        s.add_block_usage(cpu_usage, net_usage)
-            .map_err(|e| ChainError::InternalError(format!("arena add_block_usage: {e:?}")))?;
         Ok(())
     }
 
@@ -3492,7 +3684,157 @@ impl Database {
         primary_key: u64,
     ) -> Option<(u64, Vec<u8>)> {
         self.dependency_exact_read(code, scope, table, ContractIndex::Primary, primary_key);
-        self.backend.kv_row(code, scope, table, primary_key)
+        if !self.xpr_native_replay_enabled() {
+            return self.backend.kv_row(code, scope, table, primary_key);
+        }
+
+        let key = XprNativeRowKey {
+            code,
+            scope,
+            table,
+            primary_key,
+        };
+        {
+            let cache = self.xpr_native_rows.lock().unwrap();
+            if let Some(row) = cache.layers.iter().rev().find_map(|layer| layer.get(&key)) {
+                return Some(row.clone());
+            }
+            if let Some(row) = cache.dirty.get(&key) {
+                return Some(row.clone());
+            }
+            if let Some(row) = cache.base.get(&key) {
+                return row.clone();
+            }
+        }
+
+        let loaded = self.backend.kv_row(code, scope, table, primary_key);
+        self.xpr_native_rows
+            .lock()
+            .unwrap()
+            .base
+            .entry(key)
+            .or_insert_with(|| loaded.clone());
+        loaded
+    }
+
+    /// Stage a native-replay row rewrite in the current Arena undo layer. The
+    /// block commit coalesces repeated writes to the same key into one mutation.
+    pub fn xpr_native_update_key_value(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        buffer: &[u8],
+    ) -> Result<(), ChainError> {
+        self.ensure_contract_primary_not_frozen()?;
+        self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
+        let key = XprNativeRowKey {
+            code,
+            scope,
+            table,
+            primary_key,
+        };
+        let mut cache = self.xpr_native_rows.lock().unwrap();
+        let layer = cache.layers.last_mut().ok_or_else(|| {
+            ChainError::InternalError(
+                "XPR native row update executed outside an Arena undo session".into(),
+            )
+        })?;
+        layer.insert(key, (payer, buffer.to_vec()));
+        Ok(())
+    }
+
+    /// Materialize staged native rows into the current Arena session. Called at
+    /// accepted-block commit and before any fallback to deployed WASM.
+    pub fn flush_xpr_native_rows(&self) -> Result<(), ChainError> {
+        if !self.xpr_native_replay_enabled() {
+            return Ok(());
+        }
+        let pending = {
+            let cache = self.xpr_native_rows.lock().unwrap();
+            let mut pending = cache.dirty.clone();
+            for layer in &cache.layers {
+                for (key, row) in layer {
+                    pending.insert(*key, row.clone());
+                }
+            }
+            pending
+        };
+        if pending.is_empty() {
+            // `try_apply` also calls this immediately before falling back to
+            // deployed WASM. Reads made while deciding that the native handler
+            // is inapplicable may have populated `base`; invalidate them even
+            // when there was nothing to materialize so the next native action
+            // observes the WASM transition.
+            self.xpr_native_rows.lock().unwrap().base.clear();
+            return Ok(());
+        }
+        let updates = pending
+            .iter()
+            .map(|(key, (payer, value))| crate::backend::ContractRowUpdate {
+                code: key.code,
+                scope: key.scope,
+                table: key.table,
+                primary_key: key.primary_key,
+                payer: *payer,
+                value: value.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.backend
+            .update_key_value_objects(&updates)
+            .map_err(|error| {
+                ChainError::InternalError(format!("flush XPR native rows: {error:?}"))
+            })?;
+
+        let mut cache = self.xpr_native_rows.lock().unwrap();
+        for layer in &mut cache.layers {
+            layer.clear();
+        }
+        cache.dirty.clear();
+        cache.base.clear();
+        Ok(())
+    }
+
+    fn flush_xpr_native_sequences(&self) -> Result<(), ChainError> {
+        if !self.xpr_native_replay_enabled() {
+            return Ok(());
+        }
+        let (global, accounts) = {
+            let cache = self.xpr_native_sequences.lock().unwrap();
+            let mut global = cache.dirty_global;
+            let mut accounts = cache.dirty_accounts.clone();
+            for layer in &cache.layers {
+                if layer.global.is_some() {
+                    global = layer.global;
+                }
+                accounts.extend(layer.accounts.iter().map(|(&name, &value)| (name, value)));
+            }
+            (global, accounts)
+        };
+        let Some(global) = global else {
+            return Ok(());
+        };
+        let accounts = accounts
+            .into_iter()
+            .map(|(name, (recv, auth))| (name, recv, auth))
+            .collect::<Vec<_>>();
+        self.backend
+            .set_action_sequences(global, &accounts)
+            .map_err(|error| {
+                ChainError::InternalError(format!("flush XPR action sequences: {error:?}"))
+            })?;
+        let mut cache = self.xpr_native_sequences.lock().unwrap();
+        cache.base_global = None;
+        cache.base_accounts.clear();
+        cache.dirty_global = None;
+        cache.dirty_accounts.clear();
+        for layer in &mut cache.layers {
+            layer.global = None;
+            layer.accounts.clear();
+        }
+        Ok(())
     }
 
     /// Author a contract row in the arena alone (no chainbase). The arena's
@@ -3508,7 +3850,9 @@ impl Database {
         buffer: &[u8],
     ) -> Result<(), ChainError> {
         self.ensure_contract_primary_not_frozen()?;
-        self.apply_speculative_primary_create(code, scope, table, payer, primary_key, buffer)
+        self.apply_speculative_primary_create(code, scope, table, payer, primary_key, buffer)?;
+        self.invalidate_standalone_key_value_read(code, scope, table, primary_key);
+        Ok(())
     }
 
     fn apply_speculative_primary_create(
@@ -3538,7 +3882,9 @@ impl Database {
         buffer: &[u8],
     ) -> Result<(), ChainError> {
         self.ensure_contract_primary_not_frozen()?;
-        self.apply_speculative_primary_update(code, scope, table, primary_key, payer, buffer)
+        self.apply_speculative_primary_update(code, scope, table, primary_key, payer, buffer)?;
+        self.invalidate_standalone_key_value_read(code, scope, table, primary_key);
+        Ok(())
     }
 
     fn apply_speculative_primary_update(
@@ -3566,7 +3912,37 @@ impl Database {
         primary_key: u64,
     ) -> Result<(), ChainError> {
         self.ensure_contract_primary_not_frozen()?;
-        self.apply_speculative_primary_remove(code, scope, table, primary_key)
+        self.apply_speculative_primary_remove(code, scope, table, primary_key)?;
+        self.invalidate_standalone_key_value_read(code, scope, table, primary_key);
+        Ok(())
+    }
+
+    /// Keep the replay read-through cache coherent with ordinary Arena writes.
+    ///
+    /// Native rows are flushed before deployed WASM runs, but WASM can update a
+    /// row more than once in one action. Without invalidating `base`, the second
+    /// update observes the value that was loaded before the first update and
+    /// computes RAM billing from a stale size.
+    fn invalidate_standalone_key_value_read(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) {
+        if !self.xpr_native_replay_enabled() {
+            return;
+        }
+        self.xpr_native_rows
+            .lock()
+            .unwrap()
+            .base
+            .remove(&XprNativeRowKey {
+                code,
+                scope,
+                table,
+                primary_key,
+            });
     }
 
     fn apply_speculative_primary_remove(
@@ -3923,6 +4299,43 @@ impl Database {
         });
     }
 
+    /// Metadata needed by `ApplyContext::exec_one`, coalesced so the common
+    /// receiver == action-account case performs one indexed Arena lookup.
+    pub fn action_execution_metadata(
+        &self,
+        receiver: u64,
+        action_account: u64,
+    ) -> Result<ActionExecutionMetadata, ChainError> {
+        self.dependency_system_read(SystemKey::AccountMetadata(receiver));
+        let receiver_metadata = self.backend.account_metadata(receiver).ok_or_else(|| {
+            ChainError::InternalError(format!(
+                "account metadata not found for account: {}",
+                Name::new(receiver)
+            ))
+        })?;
+        let action_metadata = if receiver == action_account {
+            receiver_metadata
+        } else {
+            self.dependency_system_read(SystemKey::AccountMetadata(action_account));
+            self.backend
+                .account_metadata(action_account)
+                .ok_or_else(|| {
+                    ChainError::InternalError(format!(
+                        "account metadata not found for account: {}",
+                        Name::new(action_account)
+                    ))
+                })?
+        };
+        Ok(ActionExecutionMetadata {
+            privileged: receiver_metadata.0,
+            code_hash: receiver_metadata.5,
+            vm_type: receiver_metadata.6,
+            vm_version: receiver_metadata.7,
+            code_sequence: action_metadata.3,
+            abi_sequence: action_metadata.4,
+        })
+    }
+
     /// Whether `name` is a privileged account. A plain bool read off
     /// account_metadata. Errors when the account has no metadata.
     pub fn is_account_privileged(&self, name: u64) -> Result<bool, ChainError> {
@@ -4258,6 +4671,108 @@ impl Database {
         s.set_global_action_sequence(next)
             .map_err(|e| ChainError::InternalError(format!("arena next_global_sequence: {e:?}")))?;
         return Ok(next);
+    }
+
+    /// Advance the global, receiver, and authority counters for a single action
+    /// receipt in one arena critical section.
+    pub fn next_action_sequences(
+        &mut self,
+        receiver: u64,
+        auth_actors: &[u64],
+    ) -> Result<(u64, u64, Vec<u64>), ChainError> {
+        self.dependency_system_write(SystemKey::GlobalActionSequence);
+        self.dependency_system_write(SystemKey::AccountMetadata(receiver));
+        for actor in auth_actors {
+            self.dependency_system_write(SystemKey::AccountMetadata(*actor));
+        }
+        if self.xpr_native_replay_enabled() {
+            let mut cache = self.xpr_native_sequences.lock().unwrap();
+            let current_global = cache
+                .layers
+                .iter()
+                .rev()
+                .find_map(|layer| layer.global)
+                .or(cache.dirty_global)
+                .or(cache.base_global)
+                .unwrap_or_else(|| {
+                    let value = self.backend.global_action_sequence().unwrap_or(0);
+                    cache.base_global = Some(value);
+                    value
+                });
+            let next_global = current_global.checked_add(1).ok_or_else(|| {
+                ChainError::InternalError("global action sequence overflow".into())
+            })?;
+
+            let current_account = |cache: &XprNativeSequenceCache, name: u64| {
+                cache
+                    .layers
+                    .iter()
+                    .rev()
+                    .find_map(|layer| layer.accounts.get(&name).copied())
+                    .or_else(|| cache.dirty_accounts.get(&name).copied())
+                    .or_else(|| cache.base_accounts.get(&name).copied())
+            };
+            let load_account = |name: u64| {
+                self.backend
+                    .account_metadata(name)
+                    .map(|metadata| (metadata.1, metadata.2))
+                    .ok_or_else(|| {
+                        ChainError::InternalError(format!(
+                            "account metadata missing while advancing receipt sequences for {}",
+                            Name::new(name)
+                        ))
+                    })
+            };
+
+            let (recv, auth) = match current_account(&cache, receiver) {
+                Some(sequences) => sequences,
+                None => {
+                    let sequences = load_account(receiver)?;
+                    cache.base_accounts.insert(receiver, sequences);
+                    sequences
+                }
+            };
+            let next_recv = recv.wrapping_add(1);
+            let layer = cache.layers.last_mut().ok_or_else(|| {
+                ChainError::InternalError(
+                    "XPR action sequence advanced outside an Arena undo session".into(),
+                )
+            })?;
+            layer.global = Some(next_global);
+            layer.accounts.insert(receiver, (next_recv, auth));
+
+            let mut auth_sequences = Vec::with_capacity(auth_actors.len());
+            for &actor in auth_actors {
+                let (recv, auth) = match current_account(&cache, actor) {
+                    Some(sequences) => sequences,
+                    None => {
+                        let sequences = load_account(actor)?;
+                        cache.base_accounts.insert(actor, sequences);
+                        sequences
+                    }
+                };
+                let next_auth = auth.wrapping_add(1);
+                cache
+                    .layers
+                    .last_mut()
+                    .expect("sequence layer checked above")
+                    .accounts
+                    .insert(actor, (recv, next_auth));
+                auth_sequences.push(next_auth);
+            }
+            return Ok((next_global, next_recv, auth_sequences));
+        }
+        self.backend
+            .next_action_sequences(receiver, auth_actors)
+            .map_err(|error| {
+                ChainError::InternalError(format!("arena next_action_sequences: {error:?}"))
+            })?
+            .ok_or_else(|| {
+                ChainError::InternalError(format!(
+                    "account metadata missing while advancing receipt sequences for {}",
+                    Name::new(receiver)
+                ))
+            })
     }
 
     pub fn get_global_action_sequence(&self) -> Result<u64, ChainError> {
@@ -5321,6 +5836,230 @@ mod tests {
     }
 
     #[test]
+    fn native_xpr_rows_coalesce_and_follow_arena_undo() {
+        let mut database = Database::default();
+        database
+            .create_key_value_object_standalone(1, 1, 2, 7, 3, b"base")
+            .unwrap();
+        database.enable_xpr_native_replay();
+
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"first")
+            .unwrap();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"second")
+            .unwrap();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"second");
+        database.arena_undo();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"base");
+
+        // A WASM fallback materializes the overlay inside the active session;
+        // aborting that transaction must still restore the backend row.
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"materialized")
+            .unwrap();
+        database.flush_xpr_native_rows().unwrap();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3).unwrap().1,
+            b"materialized"
+        );
+        database.arena_undo();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"base");
+
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"outer")
+            .unwrap();
+        database.xpr_native_start_row_session().unwrap();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"lightweight-discarded")
+            .unwrap();
+        database.xpr_native_undo_row_session().unwrap();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"outer");
+        database.xpr_native_start_row_session().unwrap();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"lightweight-squashed")
+            .unwrap();
+        database.xpr_native_squash_row_session().unwrap();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3).unwrap().1,
+            b"lightweight-squashed"
+        );
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"discarded")
+            .unwrap();
+        database.arena_undo();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3).unwrap().1,
+            b"lightweight-squashed"
+        );
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"final")
+            .unwrap();
+        database.arena_squash();
+        database.commit(1).unwrap();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"final");
+    }
+
+    #[test]
+    fn native_xpr_inline_authorization_cache_is_block_scoped() {
+        let mut database = Database::default();
+        database.enable_xpr_native_replay();
+        let key = (1, 2, 3, 4, 5);
+
+        database.arena_start_undo_session();
+        database.cache_xpr_native_inline_authorization(key);
+        assert!(database.xpr_native_inline_authorization_cached(key));
+        database.commit(1).unwrap();
+        assert!(!database.xpr_native_inline_authorization_cached(key));
+
+        database.arena_start_undo_session();
+        database.cache_xpr_native_inline_authorization(key);
+        database.arena_undo();
+        assert!(!database.xpr_native_inline_authorization_cached(key));
+    }
+
+    #[test]
+    fn deferred_native_xpr_rows_span_commits_and_flush_at_checkpoint() {
+        let mut database = Database::default();
+        database
+            .create_key_value_object_standalone(1, 1, 2, 7, 3, b"base")
+            .unwrap();
+        database.enable_xpr_deferred_native_writes();
+
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"accepted")
+            .unwrap();
+        database.commit(1).unwrap();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"accepted");
+        assert_eq!(database.backend.kv_row(1, 1, 2, 3).unwrap().1, b"base");
+
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"discarded")
+            .unwrap();
+        database.arena_undo();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"accepted");
+
+        database.flush_xpr_native_rows().unwrap();
+        assert_eq!(database.backend.kv_row(1, 1, 2, 3).unwrap().1, b"accepted");
+    }
+
+    #[test]
+    fn empty_native_flush_invalidates_reads_before_wasm_fallback() {
+        let database = Database::default();
+        database
+            .create_key_value_object_standalone(1, 1, 2, 7, 3, b"before")
+            .unwrap();
+        database.enable_xpr_native_replay();
+        database.arena_start_undo_session();
+
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"before");
+        database.flush_xpr_native_rows().unwrap();
+        database
+            .backend
+            .update_key_value_object(1, 1, 2, 3, 7, b"after")
+            .unwrap();
+
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"after");
+        database.arena_undo();
+    }
+
+    #[test]
+    fn standalone_writes_refresh_native_replay_row_cache() {
+        let database = Database::default();
+        database.enable_xpr_native_replay();
+        database.arena_start_undo_session();
+
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3), None);
+        database
+            .create_key_value_object_standalone(1, 1, 2, 7, 3, b"created")
+            .unwrap();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3),
+            Some((7, b"created".to_vec()))
+        );
+
+        database
+            .update_key_value_object_standalone(1, 1, 2, 3, 8, b"first update")
+            .unwrap();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3),
+            Some((8, b"first update".to_vec()))
+        );
+        database
+            .update_key_value_object_standalone(1, 1, 2, 3, 9, b"second update is longer")
+            .unwrap();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3),
+            Some((9, b"second update is longer".to_vec()))
+        );
+
+        database
+            .remove_key_value_object_standalone(1, 1, 2, 3)
+            .unwrap();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3), None);
+        database.arena_undo();
+
+        database
+            .create_key_value_object_standalone(1, 1, 2, 7, 3, b"durable base")
+            .unwrap();
+        database.arena_start_undo_session();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3),
+            Some((7, b"durable base".to_vec()))
+        );
+        database
+            .update_key_value_object_standalone(1, 1, 2, 3, 8, b"speculative update")
+            .unwrap();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3),
+            Some((8, b"speculative update".to_vec()))
+        );
+        database.arena_undo();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3),
+            Some((7, b"durable base".to_vec()))
+        );
+    }
+
+    #[test]
+    fn deferred_native_action_sequences_are_ordered_undoable_and_batched() {
+        let mut database = Database::default();
+        database.create_account_metadata(1, false).unwrap();
+        database.create_account_metadata(2, false).unwrap();
+        database.enable_xpr_deferred_native_writes();
+
+        database.arena_start_undo_session();
+        assert_eq!(
+            database.next_action_sequences(1, &[1, 2, 1]).unwrap(),
+            (1, 1, vec![1, 1, 2])
+        );
+        database.commit(1).unwrap();
+        assert_eq!(database.backend.global_action_sequence(), None);
+        assert_eq!(database.backend.account_metadata(1).unwrap().1, 0);
+
+        database.arena_start_undo_session();
+        assert_eq!(
+            database.next_action_sequences(1, &[1]).unwrap(),
+            (2, 2, vec![3])
+        );
+        database.arena_undo();
+        database.flush_xpr_native_sequences().unwrap();
+
+        assert_eq!(database.backend.global_action_sequence(), Some(1));
+        let first = database.backend.account_metadata(1).unwrap();
+        let second = database.backend.account_metadata(2).unwrap();
+        assert_eq!((first.1, first.2), (1, 2));
+        assert_eq!((second.1, second.2), (0, 1));
+    }
+
+    #[test]
     fn webauthn_authority_round_trips_through_arena_blob() {
         let key = AuthorityPublicKey::WebAuthn {
             point: [
@@ -5972,10 +6711,23 @@ impl Database {
         self.xpr_native_replay.store(true, Ordering::Relaxed);
     }
 
+    /// Retain native replay contract-row writes between accepted blocks. The
+    /// importer flushes them before any deployed-WASM fallback and before every
+    /// durable checkpoint, so no observer can see a stale persisted state.
+    #[doc(hidden)]
+    pub fn enable_xpr_deferred_native_writes(&self) {
+        self.xpr_native_replay.store(true, Ordering::Relaxed);
+        self.xpr_defer_native_writes.store(true, Ordering::Relaxed);
+    }
+
     /// Whether the offline importer explicitly enabled native XPR handlers.
     #[doc(hidden)]
     pub fn xpr_native_replay_enabled(&self) -> bool {
         self.xpr_native_replay.load(Ordering::Relaxed)
+    }
+
+    fn xpr_deferred_native_writes_enabled(&self) -> bool {
+        self.xpr_defer_native_writes.load(Ordering::Relaxed)
     }
 
     /// Acquire a read view over the arena. The arena is `Arc`-backed with its own
@@ -6241,6 +6993,9 @@ impl Default for Database {
             speculation_freeze: Arc::new(AtomicBool::new(false)),
             authority_cache: Arc::new(Mutex::new(HashMap::new())),
             xpr_native_replay: Arc::new(AtomicBool::new(false)),
+            xpr_defer_native_writes: Arc::new(AtomicBool::new(false)),
+            xpr_native_rows: Arc::new(Mutex::new(XprNativeRowCache::default())),
+            xpr_native_sequences: Arc::new(Mutex::new(XprNativeSequenceCache::default())),
         }
     }
 }

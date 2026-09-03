@@ -13,6 +13,7 @@ pub mod mempool;
 pub mod producer_schedule;
 pub mod protocol_features;
 pub mod pulse_contract;
+pub(crate) mod replay_profile;
 pub mod resource;
 pub mod resource_limits;
 pub mod state_history;
