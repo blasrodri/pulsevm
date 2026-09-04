@@ -295,15 +295,19 @@ impl ApplyContext {
 
         cpu_used += self.exec_one()?;
 
-        let notified_pairs: Vec<(Name, u32)> = {
-            let inner = self.inner.read()?;
-            inner.notified.iter().skip(1).cloned().collect()
-        };
-
-        for (receiver, action_ordinal) in notified_pairs {
+        // A notified receiver may call `require_recipient` itself. Leap walks
+        // the growing notification queue, so fetch one entry at a time instead
+        // of snapshotting it after the first receiver executes.
+        let mut notified_index = 1;
+        loop {
+            let notified = self.inner.read()?.notified.get(notified_index).cloned();
+            let Some((receiver, action_ordinal)) = notified else {
+                break;
+            };
             self.receiver = receiver;
             self.action_ordinal = action_ordinal;
             cpu_used += self.exec_one()?;
+            notified_index += 1;
         }
 
         let (recurse_depth, inline_actions, context_free_inline_actions) = {

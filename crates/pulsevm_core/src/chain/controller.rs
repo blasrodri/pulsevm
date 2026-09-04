@@ -125,6 +125,11 @@ static PARALLEL_WAVE_TELEMETRY_ENABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var_os("PULSEVM_PARALLEL_WAVE_TELEMETRY").is_some());
 static XPR_BATCHED_REPLAY_ENABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var("PULSEVM_XPR_BATCHED_REPLAY").as_deref() == Ok("1"));
+static XPR_TRACE_ACTION_RECEIPTS_BLOCK: LazyLock<Option<u32>> = LazyLock::new(|| {
+    std::env::var("XPR_REPLAY_TRACE_ACTION_RECEIPTS_BLOCK")
+        .ok()
+        .and_then(|value| value.parse().ok())
+});
 use pulsevm_crypto::{
     Bytes,
     Digest,
@@ -3267,6 +3272,26 @@ impl Controller {
                 )));
             }
 
+            if *XPR_TRACE_ACTION_RECEIPTS_BLOCK == Some(block.block_num()) {
+                eprintln!(
+                    "action receipt trace transaction={}",
+                    receipt.transaction_id()
+                );
+                for trace in &result.trace.action_traces {
+                    if let Some(action_receipt) = &trace.receipt {
+                        eprintln!(
+                            "  ordinal={} creator={} action={}::{} digest={} receipt={}",
+                            trace.action_ordinal,
+                            trace.creator_action_ordinal,
+                            trace.act.account(),
+                            trace.act.name(),
+                            action_receipt.digest()?,
+                            action_receipt,
+                        );
+                    }
+                }
+            }
+
             // Add trace to traces
             if collect_transaction_traces {
                 transaction_traces.push(result.trace.clone());
@@ -3313,6 +3338,11 @@ impl Controller {
         }
 
         let merkle_started = replay_profiling.then(Instant::now);
+        if *XPR_TRACE_ACTION_RECEIPTS_BLOCK == Some(block.block_num()) {
+            for (index, digest) in action_receipt_digests.iter().enumerate() {
+                eprintln!("action receipt digest index={index} digest={digest}");
+            }
+        }
         let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
         let action_mroot = self.calculate_action_merkle(&mut action_receipt_digests)?;
         let merkle_elapsed = merkle_started.map_or(Duration::ZERO, |started| started.elapsed());
@@ -5111,6 +5141,85 @@ mod tests {
         .sign(&private_key, &chain_id)?;
         let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
         Ok(packed_trx)
+    }
+
+    #[tokio::test]
+    async fn notified_receiver_can_require_another_recipient() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let status = BlockStatus::Building;
+        let first = Name::from_str("notifya")?;
+        let second = Name::from_str("notifyb")?;
+        let third = Name::from_str("notifyc")?;
+
+        for account in [first, second, third] {
+            controller.execute_transaction(
+                &create_account(&private_key, account, chain_id)?,
+                &timestamp,
+                &status,
+            )?;
+        }
+
+        let notifying_contract = |recipient: Name| {
+            wat::parse_str(format!(
+                r#"
+                (module
+                  (import "env" "require_recipient" (func $notify (param i64)))
+                  (memory (export "memory") 1)
+                  (func (export "apply") (param i64 i64 i64)
+                    (call $notify (i64.const {}))))
+                "#,
+                recipient.as_u64() as i64
+            ))
+            .expect("valid notification contract")
+        };
+        let noop_contract = wat::parse_str(
+            r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "apply") (param i64 i64 i64)))
+            "#,
+        )
+        .expect("valid no-op contract");
+
+        for (account, code) in [
+            (first, notifying_contract(second)),
+            (second, notifying_contract(third)),
+            (third, noop_contract),
+        ] {
+            controller.execute_transaction(
+                &set_code(&private_key, account, code, chain_id)?,
+                &timestamp,
+                &status,
+            )?;
+        }
+
+        let result = controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                first,
+                Name::from_str("notify")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &timestamp,
+            &status,
+        )?;
+        let receivers = result
+            .trace
+            .action_traces
+            .iter()
+            .map(|trace| {
+                trace
+                    .receipt
+                    .as_ref()
+                    .expect("every scheduled notification must execute")
+                    .receiver
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(receivers, vec![first, second, third]);
+        Ok(())
     }
 
     fn fmt_res(r: &Result<TransactionResult, ChainError>) -> String {
