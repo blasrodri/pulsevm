@@ -891,6 +891,21 @@ impl MeteringGlobals {
             )),
         }
     }
+
+    #[inline]
+    fn remaining(&self, store: &mut impl AsStoreMut) -> Result<u64, RuntimeError> {
+        match self.remaining.get(store) {
+            Value::I64(value) => Ok(value as u64),
+            _ => Err(RuntimeError::new(
+                "metering remaining global has the wrong type",
+            )),
+        }
+    }
+
+    #[inline]
+    fn set_remaining(&self, store: &mut impl AsStoreMut, points: u64) -> Result<(), RuntimeError> {
+        self.remaining.set(store, Value::I64(points as i64))
+    }
 }
 
 fn charge_metering_globals(
@@ -898,17 +913,21 @@ fn charge_metering_globals(
     metering: &MeteringGlobals,
     amount: u64,
 ) -> Result<(), RuntimeError> {
-    match metering.get(store)? {
-        MeteringPoints::Remaining(remaining) if remaining >= amount => {
-            metering.set(store, remaining - amount)?;
-            Ok(())
-        }
-        _ => {
-            metering.set(store, 0)?;
-            Err(RuntimeError::new(
-                "cpu usage limit exceeded while charging a host intrinsic",
-            ))
-        }
+    // The metering middleware checks the exhausted flag immediately before a
+    // WASM `call`, so a host intrinsic is reachable only while that flag is
+    // clear. Read and update the remaining-points global directly here rather
+    // than doing two extra dynamic global accesses on every host call. The full
+    // two-global state is still initialized before execution and inspected when
+    // execution returns.
+    let remaining = metering.remaining(store)?;
+    if remaining >= amount {
+        metering.set_remaining(store, remaining - amount)?;
+        Ok(())
+    } else {
+        metering.set_remaining(store, 0)?;
+        Err(RuntimeError::new(
+            "cpu usage limit exceeded while charging a host intrinsic",
+        ))
     }
 }
 

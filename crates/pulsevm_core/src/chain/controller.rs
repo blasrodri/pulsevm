@@ -9901,6 +9901,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bulk_memory_intrinsics_preserve_eosio_semantics() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let status = BlockStatus::Building;
+        let run = Name::from_str("run")?;
+
+        let happy_path = wat::parse_str(
+            r#"
+            (module
+              (import "env" "memcpy" (func $memcpy (param i32 i32 i32) (result i32)))
+              (import "env" "memmove" (func $memmove (param i32 i32 i32) (result i32)))
+              (import "env" "memset" (func $memset (param i32 i32 i32) (result i32)))
+              (import "env" "memcmp" (func $memcmp (param i32 i32 i32) (result i32)))
+              (import "env" "eosio_assert" (func $assert (param i32 i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 8) "bulk memory intrinsic failed\00")
+              (data (i32.const 64) "abcdef")
+              (data (i32.const 80) "xxxxxx")
+              (data (i32.const 96) "abZZef")
+              (data (i32.const 112) "abcdef")
+              (data (i32.const 128) "ababcd")
+              (func (export "apply") (param i64 i64 i64)
+                (drop (call $memcpy (i32.const 80) (i32.const 64) (i32.const 6)))
+                (drop (call $memset (i32.const 82) (i32.const 346) (i32.const 2)))
+                (call $assert
+                  (i32.eq (call $memcmp (i32.const 80) (i32.const 96) (i32.const 6))
+                          (i32.const 0))
+                  (i32.const 8))
+                (drop (call $memmove (i32.const 114) (i32.const 112) (i32.const 4)))
+                (call $assert
+                  (i32.eq (call $memcmp (i32.const 112) (i32.const 128) (i32.const 6))
+                          (i32.const 0))
+                  (i32.const 8))
+                (call $assert
+                  (i32.eq (call $memcmp (i32.const 64) (i32.const 96) (i32.const 6))
+                          (i32.const 1))
+                  (i32.const 8))
+                (call $assert
+                  (i32.eq (call $memcmp (i32.const 96) (i32.const 64) (i32.const 6))
+                          (i32.const -1))
+                  (i32.const 8))))
+            "#,
+        )
+        .expect("valid bulk-memory contract");
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, happy_path, chain_id)?,
+            &timestamp,
+            &status,
+        )?;
+        controller.execute_transaction(
+            &call_contract(&private_key, PULSE_NAME, run, &Vec::<u8>::new(), chain_id)?,
+            &timestamp,
+            &status,
+        )?;
+
+        let invalid_contract = |dest: u32, src: u32, size: u32| {
+            wat::parse_str(format!(
+                r#"
+                (module
+                  (import "env" "memcpy" (func $memcpy (param i32 i32 i32) (result i32)))
+                  (memory (export "memory") 1)
+                  (func (export "apply") (param i64 i64 i64)
+                    (drop (call $memcpy (i32.const {dest}) (i32.const {src})
+                                       (i32.const {size})))))
+                "#,
+            ))
+            .expect("valid failing memcpy contract")
+        };
+        for (index, (code, expected_error)) in [
+            (invalid_contract(65, 64, 2), "non-aliasing pointers"),
+            (invalid_contract(65_535, 0, 2), "out of bounds"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            controller.execute_transaction(
+                &set_code(&private_key, PULSE_NAME, code, chain_id)?,
+                &timestamp,
+                &status,
+            )?;
+            let error = match controller.execute_transaction(
+                &call_contract(
+                    &private_key,
+                    PULSE_NAME,
+                    run,
+                    &vec![index as u8 + 1],
+                    chain_id,
+                )?,
+                &timestamp,
+                &status,
+            ) {
+                Ok(_) => panic!("invalid memcpy must trap"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected memcpy error: {error}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_push_transaction() -> Result<(), ChainError> {
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")

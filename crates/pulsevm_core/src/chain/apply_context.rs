@@ -905,12 +905,7 @@ impl ApplyContext {
         Ok(())
     }
 
-    pub fn db_get_i64(
-        &self,
-        iterator: i32,
-        buffer: &mut Vec<u8>,
-        buffer_size: usize,
-    ) -> Result<i32, ChainError> {
+    pub fn db_get_i64(&self, iterator: i32, buffer: &mut [u8]) -> Result<i32, ChainError> {
         let inner = self.inner.read()?;
 
         // Resolve the value entirely from the arena. The arena mints the same
@@ -927,13 +922,10 @@ impl ApplyContext {
                 ChainError::InternalError(format!("arena has no row for iterator {iterator}"))
             })?;
         let s = value.len();
-        if buffer_size == 0 {
+        if buffer.is_empty() {
             return Ok(s as i32);
         }
-        let copy_size = core::cmp::min(buffer_size, s);
-        if buffer.len() < copy_size {
-            buffer.resize(copy_size, 0);
-        }
+        let copy_size = core::cmp::min(buffer.len(), s);
         buffer[..copy_size].copy_from_slice(&value[..copy_size]);
         Ok(copy_size as i32)
     }
