@@ -63,6 +63,13 @@ const XPR_NOLOSS_CODE_HASH: [u8; 32] = [
     0x2f, 0xe9, 0xb5, 0x19, 0x45, 0x3d, 0x07, 0xda, 0x24, 0x24, 0x79, 0x65, 0xe6, 0x2f, 0x2e, 0x50,
     0x6d, 0xd9, 0x59, 0xde, 0x15, 0x36, 0xcb, 0x4e, 0x20, 0x5f, 0x61, 0xff, 0x76, 0xa8, 0x91, 0x1e,
 ];
+// Activated at XPR Mainnet block 141,529,683. The deployed module differs from
+// the preceding version by exactly one instruction: `unique % 24` became
+// `unique % 21`; its imports and every other instruction are byte-identical.
+const XPR_NOLOSS_V2_CODE_HASH: [u8; 32] = [
+    0xcf, 0x50, 0x04, 0x62, 0x46, 0xf6, 0xa7, 0x39, 0xa0, 0x5f, 0x63, 0xed, 0x3d, 0x8f, 0x98, 0xd7,
+    0xcb, 0x13, 0x17, 0x8d, 0x32, 0x42, 0x28, 0x9d, 0x8b, 0x29, 0xb6, 0x36, 0x65, 0xca, 0x30, 0xc2,
+];
 
 pub(super) struct ReadOnlyWasmProbe {
     pub cache_hit: bool,
@@ -72,8 +79,12 @@ pub(super) struct ReadOnlyWasmProbe {
 }
 
 fn noloss_trade_data_key(receiver: u64, action: &Action, code_hash: &[u8; 32]) -> Option<[u64; 2]> {
-    if *code_hash != XPR_NOLOSS_CODE_HASH
-        || receiver != NOLOSS
+    let unique_modulus = match *code_hash {
+        XPR_NOLOSS_CODE_HASH => 24,
+        XPR_NOLOSS_V2_CODE_HASH => 21,
+        _ => return None,
+    };
+    if receiver != NOLOSS
         || action.account().as_u64() != NOLOSS
         || action.name().as_u64() != TRADE
         || action.data().len() != 16
@@ -83,15 +94,15 @@ fn noloss_trade_data_key(receiver: u64, action: &Action, code_hash: &[u8; 32]) -
     let data = action.data();
     let user = u64::from_le_bytes(data[..8].try_into().expect("length checked"));
     let unique = u64::from_le_bytes(data[8..].try_into().expect("length checked"));
-    Some([user, unique % 24])
+    Some([user, unique % unique_modulus])
 }
 
 /// Memoize the deployed `noloss::trade` scanner only after canonical WASM has
 /// proved that a normalized invocation schedules no inline action and changes
 /// none of the contracts it reads. Static bytecode audit establishes that the
 /// action reads Alcor/proton.swaps state, has no time/transaction-id imports,
-/// and uses `unique` only as `unique % 24`; any dependency write invalidates the
-/// learned result before another call can bypass WASM.
+/// and uses `unique` only modulo a code-hash-pinned constant; any dependency
+/// write invalidates the learned result before another call can bypass WASM.
 pub(super) fn prepare_read_only_wasm(
     context: &ApplyContext,
     action: &Action,
@@ -1832,6 +1843,14 @@ mod tests {
         );
         assert_eq!(
             noloss_trade_data_key(NOLOSS, &make_action(73), &XPR_NOLOSS_CODE_HASH),
+            Some([user.as_u64(), 1])
+        );
+        assert_eq!(
+            noloss_trade_data_key(NOLOSS, &make_action(43), &XPR_NOLOSS_V2_CODE_HASH),
+            Some([user.as_u64(), 1])
+        );
+        assert_eq!(
+            noloss_trade_data_key(NOLOSS, &make_action(64), &XPR_NOLOSS_V2_CODE_HASH),
             Some([user.as_u64(), 1])
         );
         assert!(noloss_trade_data_key(NOLOSS, &make_action(49), &[0; 32]).is_none());
