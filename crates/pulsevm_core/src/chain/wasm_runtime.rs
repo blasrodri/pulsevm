@@ -1348,6 +1348,43 @@ impl WasmRuntime {
         }
     }
 
+    /// Queue an already-deployed contract without copying its bytecode on every
+    /// replay look-ahead pass. The cache reservation happens before the database
+    /// lookup, so repeated action receivers are a cheap hash-table hit.
+    pub(crate) fn schedule_database_precompile(
+        &self,
+        database: &Database,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) {
+        let Some(tx) = &self.precompile_tx else {
+            return;
+        };
+        let id = Id::new(code_hash);
+        {
+            let Ok(mut inner) = self.inner.write() else {
+                return;
+            };
+            if inner.code_cache.contains(&id) || !inner.precompiling.insert(id) {
+                return;
+            }
+        }
+
+        let Ok(code) = database.get_code_bytes_by_hash(&code_hash, vm_type, vm_version) else {
+            if let Ok(mut inner) = self.inner.write() {
+                inner.precompiling.remove(&id);
+            }
+            return;
+        };
+        if let Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) =
+            tx.try_send(PrecompileJob { id, code })
+            && let Ok(mut inner) = self.inner.write()
+        {
+            inner.precompiling.remove(&job.id);
+        }
+    }
+
     pub fn run(
         &mut self,
         receiver: Name,

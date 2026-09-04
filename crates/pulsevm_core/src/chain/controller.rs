@@ -4403,6 +4403,44 @@ impl Controller {
         self.db.clone()
     }
 
+    /// Best-effort migration replay look-ahead for direct WASM receivers.
+    ///
+    /// Compilation is state-independent and can run on the runtime's worker
+    /// pool while earlier blocks execute. Transactions themselves remain in
+    /// canonical order. Sorting by frequency makes the bounded queue favor the
+    /// contracts most likely to remove a synchronous compile stall.
+    #[doc(hidden)]
+    pub fn schedule_migration_wasm_precompiles(&self, blocks: &[AuthenticatedMigrationBlock]) {
+        let mut frequencies = HashMap::<u64, usize>::new();
+        for authenticated in blocks {
+            for receipt in &authenticated.block().transactions {
+                let Some(packed) = receipt.packed_trx() else {
+                    continue;
+                };
+                for action in &packed.get_transaction().actions {
+                    *frequencies.entry(action.account().as_u64()).or_default() += 1;
+                }
+            }
+        }
+        let mut receivers: Vec<_> = frequencies.into_iter().collect();
+        receivers.sort_unstable_by(|(left_name, left_count), (right_name, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_name.cmp(right_name))
+        });
+        for (receiver, _) in receivers {
+            let Ok((code_hash, vm_type, vm_version)) = self.db.account_code_hash_vm(receiver)
+            else {
+                continue;
+            };
+            if code_hash == [0; 32] {
+                continue;
+            }
+            self.wasm_runtime
+                .schedule_database_precompile(&self.db, code_hash, vm_type, vm_version);
+        }
+    }
+
     /// Snapshot the accepted header-authentication state for the bulk XPR
     /// importer. The returned verifier is deliberately unavailable to normal
     /// nodes and cannot be created while speculative blocks are pending.

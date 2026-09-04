@@ -871,6 +871,7 @@ async fn main() -> Result<()> {
         if profile_replay {
             signature_wait_time += signature_wait_started.elapsed();
         }
+        controller.schedule_migration_wasm_precompiles(&batch);
         for authenticated in batch {
             let block = authenticated.block();
             if block.transactions.is_empty() {
