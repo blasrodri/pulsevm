@@ -386,8 +386,16 @@ impl ApplyContext {
         } else {
             metadata.code_hash
         };
-        let xpr_native_cpu =
-            super::xpr_native_replay::try_apply(self, &action, &execution_code_hash)?;
+        let read_only_probe =
+            super::xpr_native_replay::prepare_read_only_wasm(self, &action, &execution_code_hash)?;
+        let xpr_native_cpu = if read_only_probe
+            .as_ref()
+            .is_some_and(|probe| probe.cache_hit)
+        {
+            Some(0)
+        } else {
+            super::xpr_native_replay::try_apply(self, &action, &execution_code_hash)?
+        };
         if let Some(native_cpu) = xpr_native_cpu {
             cpu_used += native_cpu;
             self.trx_context.checktime()?;
@@ -400,14 +408,27 @@ impl ApplyContext {
                 inner.cpu_limit
             };
 
-            cpu_used += self.wasm_runtime.run(
+            let wasm_cpu = self.wasm_runtime.run(
                 self.receiver.clone(),
                 action.clone(),
                 self.clone(),
                 self.db.clone(),
                 &execution_code_hash,
                 cpu_limit,
-            )?;
+            );
+            let wasm_cpu = match wasm_cpu {
+                Ok(wasm_cpu) => wasm_cpu,
+                Err(error) => {
+                    if read_only_probe.is_some() {
+                        super::xpr_native_replay::cancel_read_only_wasm(self);
+                    }
+                    return Err(error);
+                }
+            };
+            cpu_used += wasm_cpu;
+            if let Some(probe) = read_only_probe {
+                super::xpr_native_replay::finish_read_only_wasm(self, probe)?;
+            }
         }
 
         // Leap's RAM_RESTRICTIONS feature prevents an unprivileged contract
@@ -2909,6 +2930,38 @@ impl ApplyContext {
 
     pub(crate) fn flush_xpr_native_rows(&self) -> Result<(), ChainError> {
         self.db.flush_xpr_native_rows()
+    }
+
+    pub(crate) fn has_scheduled_inline_actions(&self) -> Result<bool, ChainError> {
+        Ok(!self.inner.read()?.inline_actions.is_empty())
+    }
+
+    pub(crate) fn xpr_read_only_wasm_cache_probe(
+        &self,
+        code_hash: [u8; 32],
+        action: u64,
+        data_key: [u64; 2],
+    ) -> bool {
+        self.db
+            .xpr_read_only_wasm_cache_probe(code_hash, self.receiver.as_u64(), action, data_key)
+    }
+
+    pub(crate) fn xpr_promote_read_only_wasm_cache(
+        &self,
+        code_hash: [u8; 32],
+        action: u64,
+        data_key: [u64; 2],
+    ) -> bool {
+        self.db.xpr_promote_read_only_wasm_cache(
+            code_hash,
+            self.receiver.as_u64(),
+            action,
+            data_key,
+        )
+    }
+
+    pub(crate) fn xpr_cancel_read_only_wasm_capture(&self) {
+        self.db.xpr_cancel_read_only_wasm_capture();
     }
 
     /// Validated consensus context for the block applying this action.

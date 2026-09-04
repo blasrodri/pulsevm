@@ -689,6 +689,17 @@ struct XprNativeRowCache {
     dirty: BTreeMap<XprNativeRowKey, XprNativeRow>,
     layers: Vec<BTreeMap<XprNativeRowKey, XprNativeRow>>,
     inline_authorization: Option<(u64, u64, u64, u64, u64)>,
+    contract_generations: HashMap<u64, u64>,
+    read_only_wasm: HashMap<XprReadOnlyWasmKey, Vec<(u64, u64)>>,
+    read_only_capture: Option<HashMap<u64, u64>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct XprReadOnlyWasmKey {
+    code_hash: [u8; 32],
+    receiver: u64,
+    action: u64,
+    data_key: [u64; 2],
 }
 
 #[derive(Default)]
@@ -831,6 +842,7 @@ impl Database {
         index: ContractIndex,
         primary: u64,
     ) {
+        self.capture_xpr_read_only_contract(code);
         if let Some(recorder) = &self.dependency_recorder {
             recorder.exact_read(DependencyKey::Contract(ContractRowKey::new(
                 code, scope, table, index, primary,
@@ -839,6 +851,7 @@ impl Database {
     }
 
     fn dependency_table_read(&self, code: u64, scope: u64, table: u64) {
+        self.capture_xpr_read_only_contract(code);
         if let Some(recorder) = &self.dependency_recorder {
             recorder.exact_read(DependencyKey::Contract(ContractRowKey::table(
                 code, scope, table,
@@ -847,6 +860,7 @@ impl Database {
     }
 
     fn dependency_range_read(&self, code: u64, scope: u64, table: u64, index: ContractIndex) {
+        self.capture_xpr_read_only_contract(code);
         if let Some(recorder) = &self.dependency_recorder {
             recorder.range_read(RangeDependency::Contract(ContractRangeKey::new(
                 code, scope, table, index,
@@ -863,6 +877,19 @@ impl Database {
         primary: u64,
     ) {
         self.bump_speculation_epoch();
+        if self.xpr_native_replay_enabled() {
+            let mut cache = self.xpr_native_rows.lock().unwrap();
+            let capturing = cache.read_only_capture.is_some();
+            if capturing || cache.contract_generations.contains_key(&code) {
+                let previous = cache.contract_generations.get(&code).copied().unwrap_or(0);
+                if let Some(capture) = &mut cache.read_only_capture {
+                    capture.entry(code).or_insert(previous);
+                }
+                cache
+                    .contract_generations
+                    .insert(code, previous.wrapping_add(1));
+            }
+        }
         if let Some(recorder) = &self.dependency_recorder {
             recorder.write(DependencyKey::Contract(ContractRowKey::new(
                 code, scope, table, index, primary,
@@ -902,6 +929,24 @@ impl Database {
         if let Some(epoch) = self.speculation_epoch.get() {
             epoch.fetch_add(1, Ordering::AcqRel);
         }
+    }
+
+    fn capture_xpr_read_only_contract(&self, code: u64) {
+        if !self.xpr_native_replay_enabled() {
+            return;
+        }
+        let mut cache = self.xpr_native_rows.lock().unwrap();
+        if cache.read_only_capture.is_none() {
+            return;
+        }
+        let generation = cache.contract_generations.get(&code).copied().unwrap_or(0);
+        cache.contract_generations.entry(code).or_insert(generation);
+        cache
+            .read_only_capture
+            .as_mut()
+            .expect("capture checked above")
+            .entry(code)
+            .or_insert(generation);
     }
 
     fn ensure_contract_primary_not_frozen(&self) -> Result<(), ChainError> {
@@ -2127,6 +2172,81 @@ impl Database {
         if self.xpr_native_replay_enabled() {
             self.xpr_native_rows.lock().unwrap().inline_authorization = None;
         }
+    }
+
+    /// Look up a replay-only memoized WASM action and return the dependency
+    /// generations against which a miss must be evaluated. The cache is keyed
+    /// by the complete deployed code hash and an action-specific normalized
+    /// payload; contract writes invalidate only entries that read that code.
+    #[doc(hidden)]
+    pub fn xpr_read_only_wasm_cache_probe(
+        &self,
+        code_hash: [u8; 32],
+        receiver: u64,
+        action: u64,
+        data_key: [u64; 2],
+    ) -> bool {
+        let mut cache = self.xpr_native_rows.lock().unwrap();
+        let key = XprReadOnlyWasmKey {
+            code_hash,
+            receiver,
+            action,
+            data_key,
+        };
+        let hit = cache.read_only_wasm.get(&key).is_some_and(|cached| {
+            cached.iter().all(|(code, expected)| {
+                cache.contract_generations.get(code).copied().unwrap_or(0) == *expected
+            })
+        });
+        if !hit {
+            cache.read_only_capture = Some(HashMap::new());
+        }
+        hit
+    }
+
+    /// Promote a canonical WASM execution only if none of its contract-state
+    /// dependencies changed while it ran. Inline actions are screened by the
+    /// caller because they are scheduled outside the current receiver.
+    #[doc(hidden)]
+    pub fn xpr_promote_read_only_wasm_cache(
+        &self,
+        code_hash: [u8; 32],
+        receiver: u64,
+        action: u64,
+        data_key: [u64; 2],
+    ) -> bool {
+        let mut cache = self.xpr_native_rows.lock().unwrap();
+        let Some(captured) = cache.read_only_capture.take() else {
+            return false;
+        };
+        let expected_generations = captured.into_iter().collect::<Vec<_>>();
+        let unchanged = expected_generations.iter().all(|(code, expected)| {
+            cache.contract_generations.get(code).copied().unwrap_or(0) == *expected
+        });
+        if !unchanged {
+            return false;
+        }
+        // Historical replay currently has one caller, but retain a hard bound
+        // so adversarial account diversity cannot turn the optimization into
+        // an unbounded process-local cache.
+        if cache.read_only_wasm.len() >= 4_096 {
+            cache.read_only_wasm.clear();
+        }
+        cache.read_only_wasm.insert(
+            XprReadOnlyWasmKey {
+                code_hash,
+                receiver,
+                action,
+                data_key,
+            },
+            expected_generations,
+        );
+        true
+    }
+
+    #[doc(hidden)]
+    pub fn xpr_cancel_read_only_wasm_capture(&self) {
+        self.xpr_native_rows.lock().unwrap().read_only_capture = None;
     }
     pub fn arena_squash(&self) {
         self.backend.squash();
@@ -5921,6 +6041,32 @@ mod tests {
         database.cache_xpr_native_inline_authorization(key);
         database.arena_undo();
         assert!(!database.xpr_native_inline_authorization_cached(key));
+    }
+
+    #[test]
+    fn read_only_wasm_cache_invalidates_only_on_dependency_writes() {
+        let database = Database::default();
+        database
+            .create_key_value_object_standalone(10, 10, 1, 10, 1, b"dependency")
+            .unwrap();
+        database.enable_xpr_native_replay();
+        let code_hash = [0x5a; 32];
+
+        assert!(!database.xpr_read_only_wasm_cache_probe(code_hash, 30, 40, [50, 60]));
+        assert!(database.arena_kv_row(10, 10, 1, 1).is_some());
+        assert!(database.xpr_promote_read_only_wasm_cache(code_hash, 30, 40, [50, 60]));
+        assert!(database.xpr_read_only_wasm_cache_probe(code_hash, 30, 40, [50, 60]));
+
+        database
+            .create_key_value_object_standalone(99, 99, 1, 1, 99, b"unrelated")
+            .unwrap();
+        assert!(database.xpr_read_only_wasm_cache_probe(code_hash, 30, 40, [50, 60]));
+
+        database
+            .update_key_value_object_standalone(10, 10, 1, 1, 10, b"changed")
+            .unwrap();
+        assert!(!database.xpr_read_only_wasm_cache_probe(code_hash, 30, 40, [50, 60]));
+        database.xpr_cancel_read_only_wasm_capture();
     }
 
     #[test]

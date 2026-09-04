@@ -133,6 +133,16 @@ struct ReplayProfile {
     wasm: BTreeMap<(u64, u64, [u8; 32]), WasmStats>,
     native_bot: NativeBotTimingNanos,
     native_onblock: NativeOnblockTimingNanos,
+    read_only_wasm: ReadOnlyWasmCacheStats,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReadOnlyWasmCacheStats {
+    hits: u64,
+    misses: u64,
+    promotions: u64,
+    inline_declines: u64,
+    mutation_declines: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -263,6 +273,34 @@ pub fn record_native_onblock(timing: NativeOnblockTiming) {
     }
 }
 
+pub fn record_read_only_wasm_probe(hit: bool) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut profile) = PROFILE.lock() {
+        if hit {
+            profile.read_only_wasm.hits += 1;
+        } else {
+            profile.read_only_wasm.misses += 1;
+        }
+    }
+}
+
+pub fn record_read_only_wasm_finish(promoted: bool, scheduled_inline: bool) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut profile) = PROFILE.lock() {
+        if promoted {
+            profile.read_only_wasm.promotions += 1;
+        } else if scheduled_inline {
+            profile.read_only_wasm.inline_declines += 1;
+        } else {
+            profile.read_only_wasm.mutation_declines += 1;
+        }
+    }
+}
+
 pub fn record_block(block_num: u32, timing: BlockTiming) {
     if !enabled() {
         return;
@@ -339,6 +377,17 @@ pub fn record_block(block_num: u32, timing: BlockTiming) {
             ms(onblock.account_usage),
             ms(onblock.receipt),
             ms(onblock.resources),
+        );
+    }
+    let read_only = snapshot.read_only_wasm;
+    if read_only.hits + read_only.misses > 0 {
+        info!(
+            "replay profile read_only_wasm_cache hits={} misses={} promotions={} inline_declines={} mutation_declines={}",
+            read_only.hits,
+            read_only.misses,
+            read_only.promotions,
+            read_only.inline_declines,
+            read_only.mutation_declines,
         );
     }
     for (reason, calls) in snapshot.native_declines {

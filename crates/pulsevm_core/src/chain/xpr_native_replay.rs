@@ -57,6 +57,84 @@ const GLOBALSD: u64 = 7_235_159_550_301_569_024;
 const PRODUCERS: u64 = 12_531_438_729_690_087_424;
 pub(super) const MECHANICS: u64 = 10_561_173_457_217_781_760;
 pub(super) const CPU: u64 = 5_004_625_085_915_463_680;
+const NOLOSS: u64 = 11_322_977_863_340_130_304;
+const TRADE: u64 = 14_829_391_500_256_739_328;
+const XPR_NOLOSS_CODE_HASH: [u8; 32] = [
+    0x2f, 0xe9, 0xb5, 0x19, 0x45, 0x3d, 0x07, 0xda, 0x24, 0x24, 0x79, 0x65, 0xe6, 0x2f, 0x2e, 0x50,
+    0x6d, 0xd9, 0x59, 0xde, 0x15, 0x36, 0xcb, 0x4e, 0x20, 0x5f, 0x61, 0xff, 0x76, 0xa8, 0x91, 0x1e,
+];
+
+pub(super) struct ReadOnlyWasmProbe {
+    pub cache_hit: bool,
+    code_hash: [u8; 32],
+    action: u64,
+    data_key: [u64; 2],
+}
+
+fn noloss_trade_data_key(receiver: u64, action: &Action, code_hash: &[u8; 32]) -> Option<[u64; 2]> {
+    if *code_hash != XPR_NOLOSS_CODE_HASH
+        || receiver != NOLOSS
+        || action.account().as_u64() != NOLOSS
+        || action.name().as_u64() != TRADE
+        || action.data().len() != 16
+    {
+        return None;
+    }
+    let data = action.data();
+    let user = u64::from_le_bytes(data[..8].try_into().expect("length checked"));
+    let unique = u64::from_le_bytes(data[8..].try_into().expect("length checked"));
+    Some([user, unique % 24])
+}
+
+/// Memoize the deployed `noloss::trade` scanner only after canonical WASM has
+/// proved that a normalized invocation schedules no inline action and changes
+/// none of the contracts it reads. Static bytecode audit establishes that the
+/// action reads Alcor/proton.swaps state, has no time/transaction-id imports,
+/// and uses `unique` only as `unique % 24`; any dependency write invalidates the
+/// learned result before another call can bypass WASM.
+pub(super) fn prepare_read_only_wasm(
+    context: &ApplyContext,
+    action: &Action,
+    code_hash: &[u8; 32],
+) -> Result<Option<ReadOnlyWasmProbe>, ChainError> {
+    if !context.xpr_native_replay_enabled() || !context.is_explicitly_billed()? {
+        return Ok(None);
+    }
+    let Some(data_key) = noloss_trade_data_key(context.receiver().as_u64(), action, code_hash)
+    else {
+        return Ok(None);
+    };
+    let cache_hit =
+        context.xpr_read_only_wasm_cache_probe(*code_hash, action.name().as_u64(), data_key);
+    super::replay_profile::record_read_only_wasm_probe(cache_hit);
+    if cache_hit {
+        context.require_authorization(&Name::new(data_key[0]), None)?;
+    }
+    Ok(Some(ReadOnlyWasmProbe {
+        cache_hit,
+        code_hash: *code_hash,
+        action: action.name().as_u64(),
+        data_key,
+    }))
+}
+
+pub(super) fn finish_read_only_wasm(
+    context: &ApplyContext,
+    probe: ReadOnlyWasmProbe,
+) -> Result<(), ChainError> {
+    let scheduled_inline = context.has_scheduled_inline_actions()?;
+    let promoted = if scheduled_inline {
+        false
+    } else {
+        context.xpr_promote_read_only_wasm_cache(probe.code_hash, probe.action, probe.data_key)
+    };
+    super::replay_profile::record_read_only_wasm_finish(promoted, scheduled_inline);
+    Ok(())
+}
+
+pub(super) fn cancel_read_only_wasm(context: &ApplyContext) {
+    context.xpr_cancel_read_only_wasm_capture();
+}
 
 // XPRNetwork/proton.contracts commit 4c31f5f5d5d7d36cd752f3e498075fe9f87aa23b.
 const XPR_SYSTEM_CODE_HASH: [u8; 32] = [
@@ -1719,6 +1797,8 @@ struct FeedActionData {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
 
     #[test]
@@ -1728,6 +1808,33 @@ mod tests {
         assert!(is_supported_oracle_code_hash(&XPR_ORACLES_V8_CODE_HASH));
         assert!(oracle_uses_v2_layout(&XPR_ORACLES_V8_CODE_HASH));
         assert!(!is_supported_oracle_code_hash(&[0; 32]));
+    }
+
+    #[test]
+    fn noloss_trade_cache_key_preserves_user_and_normalizes_unique() {
+        let user = Name::from_str("jamestaggart").unwrap();
+        let make_action = |unique: u64| {
+            let mut data = user.as_u64().to_le_bytes().to_vec();
+            data.extend_from_slice(&unique.to_le_bytes());
+            Action::new(
+                Name::new(NOLOSS),
+                Name::new(TRADE),
+                data,
+                vec![PermissionLevel::new(user.as_u64(), ACTIVE_NAME.as_u64())],
+            )
+        };
+
+        assert_eq!(Name::from_str("noloss").unwrap().as_u64(), NOLOSS);
+        assert_eq!(Name::from_str("trade").unwrap().as_u64(), TRADE);
+        assert_eq!(
+            noloss_trade_data_key(NOLOSS, &make_action(49), &XPR_NOLOSS_CODE_HASH),
+            Some([user.as_u64(), 1])
+        );
+        assert_eq!(
+            noloss_trade_data_key(NOLOSS, &make_action(73), &XPR_NOLOSS_CODE_HASH),
+            Some([user.as_u64(), 1])
+        );
+        assert!(noloss_trade_data_key(NOLOSS, &make_action(49), &[0; 32]).is_none());
     }
 
     #[test]
