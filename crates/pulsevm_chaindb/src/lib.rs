@@ -881,6 +881,28 @@ pub struct DeferredTransaction {
     pub packed_trx: Vec<u8>,
 }
 
+/// Raw objects currently billed to one account. This is an offline diagnostic
+/// view: the database facade applies Leap's billable-size constants to these
+/// counts and lengths so a stored `resource_usage.ram_usage` can be reconciled
+/// against the live Arena contents without changing consensus state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountRamInventory {
+    pub account_exists: bool,
+    pub abi_bytes: usize,
+    pub code_bytes: usize,
+    pub permission_auth_blobs: Vec<Vec<u8>>,
+    pub permission_links: usize,
+    pub contract_tables: usize,
+    pub contract_kv_rows: usize,
+    pub contract_kv_value_bytes: usize,
+    pub contract_idx64_rows: usize,
+    pub contract_idx128_rows: usize,
+    pub contract_idx256_rows: usize,
+    pub contract_idx_double_rows: usize,
+    pub contract_idx_long_double_rows: usize,
+    pub deferred_packed_bytes: Vec<usize>,
+}
+
 struct TxByTrxId;
 impl IndexedBy<TransactionRow> for TxByTrxId {
     type Key = [u8; 32];
@@ -1747,6 +1769,97 @@ impl ChainDatabase {
                 .map(|b| b.to_vec())
                 .unwrap_or_default(),
         )
+    }
+
+    /// Enumerate every live object category whose RAM is billed to `account`.
+    /// Intended for checkpoint audits; this performs full scans of contract
+    /// payer columns and should not be called from block execution.
+    pub fn account_ram_inventory(&self, account: u64) -> Result<AccountRamInventory, DbError> {
+        let db = self.read();
+        let mut inventory = AccountRamInventory::default();
+
+        if let Some(row) = db.find_by::<AccountRow, AccountRowByName>(&account)? {
+            inventory.account_exists = true;
+            inventory.abi_bytes = db.blob::<AccountRow>(row.abi)?.len();
+        }
+
+        if let Some(metadata) = db.find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&account)?
+            && metadata.code_hash != [0; 32]
+        {
+            let code = db
+                .find_by::<CodeRow, CodeByHash>(&(
+                    metadata.code_hash,
+                    metadata.vm_type,
+                    metadata.vm_version,
+                ))?
+                .ok_or_else(|| {
+                    DbError::Corrupted(format!(
+                        "account {account} references a missing code object"
+                    ))
+                })?;
+            inventory.code_bytes = db.blob::<CodeRow>(code.code)?.len();
+        }
+
+        inventory.permission_auth_blobs = db
+            .table::<PermissionRow>()?
+            .iter()
+            .filter(|row| row.owner == account)
+            .map(|row| db.blob::<PermissionRow>(row.auth).map(<[u8]>::to_vec))
+            .collect::<Result<Vec<_>, _>>()?;
+        inventory.permission_links = db
+            .table::<PermissionLinkRow>()?
+            .iter()
+            .filter(|row| row.account == account)
+            .count();
+        inventory.contract_tables = db
+            .table::<ContractTableRow>()?
+            .iter()
+            .filter(|row| row.payer == account)
+            .count();
+        for row in db
+            .table::<ContractKeyValueRow>()?
+            .iter()
+            .filter(|row| row.payer == account)
+        {
+            inventory.contract_kv_rows += 1;
+            inventory.contract_kv_value_bytes += db.blob::<ContractKeyValueRow>(row.value)?.len();
+        }
+        inventory.contract_idx64_rows = db
+            .table::<ContractIndex64Row>()?
+            .iter()
+            .filter(|row| row.payer == account)
+            .count();
+        inventory.contract_idx128_rows = db
+            .table::<ContractIndex128Row>()?
+            .iter()
+            .filter(|row| row.payer == account)
+            .count();
+        inventory.contract_idx256_rows = db
+            .table::<ContractIndex256Row>()?
+            .iter()
+            .filter(|row| row.payer == account)
+            .count();
+        inventory.contract_idx_double_rows = db
+            .table::<ContractIndexDoubleRow>()?
+            .iter()
+            .filter(|row| row.payer == account)
+            .count();
+        inventory.contract_idx_long_double_rows = db
+            .table::<ContractIndexLongDoubleRow>()?
+            .iter()
+            .filter(|row| row.payer == account)
+            .count();
+        inventory.deferred_packed_bytes = db
+            .table::<DeferredTransactionRow>()?
+            .iter()
+            .filter(|row| row.payer == account)
+            .map(|row| {
+                db.blob::<DeferredTransactionRow>(row.packed_trx)
+                    .map(<[u8]>::len)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(inventory)
     }
 
     /// The account's `last_code_update` (fc microseconds), for the RPC account
@@ -3311,6 +3424,30 @@ impl ChainDatabase {
             .ok()
             .flatten()
             .map(|r| r.ram_usage)
+    }
+
+    /// Compare-and-set repair for an independently audited offline replay
+    /// checkpoint. Runtime block execution must use `add_pending_ram_usage`;
+    /// this narrow primitive exists only to recover a checkpoint produced by a
+    /// superseded replay binary and refuses stale or unexpected input.
+    pub fn repair_account_ram_usage(
+        &self,
+        owner: u64,
+        expected: u64,
+        replacement: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let (id, actual) = db
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
+            .map(|row| (row.id(), row.ram_usage))
+            .ok_or_else(|| DbError::Corrupted(format!("resource usage missing for {owner}")))?;
+        if actual != expected {
+            return Err(DbError::Corrupted(format!(
+                "RAM repair expected {expected} bytes for {owner}, found {actual}"
+            )));
+        }
+        db.modify::<ResourceUsageRow>(id, |row| row.ram_usage = replacement)?;
+        Ok(())
     }
 
     /// Mirrors `add_transaction_usage`: advances the account's net/cpu usage

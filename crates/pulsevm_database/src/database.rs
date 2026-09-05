@@ -39,11 +39,16 @@ use crate::{
     CpuLimitResult,
     ElasticLimitParameters,
     Float128,
+    Index64Object,
+    Index128Object,
+    Index256Object,
+    IndexDoubleObject,
+    IndexLongDoubleObject,
+    KeyValueObject,
     NetLimitResult,
-    // `PermissionObject` is named only for its compile-time `billable_size_v`
-    // (the RAM a permission bills); the arena is the sole database backend.
     PermissionObject,
     Ratio,
+    TableObject,
     U256,
     dependency::{
         ContractIndex,
@@ -155,6 +160,48 @@ pub struct ArenaAccountMetadata {
     pub code_hash: [u8; 32],
     pub vm_type: u8,
     pub vm_version: u8,
+}
+
+/// Reconciliation of one account's stored RAM usage against all live objects
+/// currently billed to it in Arena.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountRamBillingBreakdown {
+    pub account: i64,
+    pub abi: i64,
+    pub code: i64,
+    pub permissions: i64,
+    pub permission_links: i64,
+    pub contract_tables: i64,
+    pub contract_kv: i64,
+    pub contract_idx64: i64,
+    pub contract_idx128: i64,
+    pub contract_idx256: i64,
+    pub contract_idx_double: i64,
+    pub contract_idx_long_double: i64,
+    pub deferred: i64,
+}
+
+impl AccountRamBillingBreakdown {
+    pub fn total(&self) -> Result<i64, ChainError> {
+        [
+            self.account,
+            self.abi,
+            self.code,
+            self.permissions,
+            self.permission_links,
+            self.contract_tables,
+            self.contract_kv,
+            self.contract_idx64,
+            self.contract_idx128,
+            self.contract_idx256,
+            self.contract_idx_double,
+            self.contract_idx_long_double,
+            self.deferred,
+        ]
+        .into_iter()
+        .try_fold(0i64, |total, value| total.checked_add(value))
+        .ok_or_else(|| ChainError::InternalError("RAM inventory overflow".into()))
+    }
 }
 /// Converts public elastic-limit parameters into the arena's stored form.
 fn to_elastic_params(p: &ElasticLimitParameters) -> crate::backend::ElasticParams {
@@ -3559,6 +3606,138 @@ impl Database {
             .ok_or_else(|| {
                 ChainError::InternalError(format!("resource usage not found: {account_name}"))
             })
+    }
+
+    /// Reconstruct the RAM represented by every live object billed to an
+    /// account. This is deliberately an offline audit API: its payer scans are
+    /// too expensive for the consensus hot path and it never mutates state.
+    pub fn account_ram_billing_breakdown(
+        &self,
+        account_name: u64,
+    ) -> Result<AccountRamBillingBreakdown, ChainError> {
+        use pulsevm_constants::{
+            OVERHEAD_PER_ACCOUNT_RAM_BYTES,
+            SETCODE_RAM_BYTES_MULTIPLIER,
+        };
+
+        const GENERATED_TRANSACTION_BILLABLE_SIZE: i64 = 272;
+
+        let raw = self
+            .backend
+            .account_ram_inventory(account_name)
+            .map_err(|error| {
+                ChainError::InternalError(format!("RAM inventory failed: {error:?}"))
+            })?;
+        let inventory_bytes = |bytes: usize| -> Result<i64, ChainError> {
+            i64::try_from(bytes)
+                .map_err(|_| ChainError::InternalError("RAM inventory overflow".into()))
+        };
+        let checked_add = |left: i64, right: i64| -> Result<i64, ChainError> {
+            left.checked_add(right)
+                .ok_or_else(|| ChainError::InternalError("RAM inventory overflow".into()))
+        };
+        let permissions = raw
+            .permission_auth_blobs
+            .iter()
+            .try_fold(0i64, |total, blob| {
+                authority_blob_billable_size(blob)
+                    .and_then(|dynamic| {
+                        i64::try_from(billable_size_v::<PermissionObject>())
+                            .ok()
+                            .and_then(|fixed| fixed.checked_add(dynamic))
+                            .and_then(|billable| total.checked_add(billable))
+                    })
+                    .ok_or_else(|| {
+                        ChainError::InternalError(format!(
+                            "malformed authority or RAM overflow while auditing account {account_name}"
+                        ))
+                    })
+            })?;
+        let deferred = raw.deferred_packed_bytes.iter().try_fold(
+            0i64,
+            |total, packed_bytes| -> Result<i64, ChainError> {
+                let packed_bytes = inventory_bytes(*packed_bytes)?;
+                let billable = checked_add(GENERATED_TRANSACTION_BILLABLE_SIZE, packed_bytes)?;
+                checked_add(total, billable)
+            },
+        )?;
+        let count_bytes = |count: usize, bytes: u64| -> Result<i64, ChainError> {
+            i64::try_from(count)
+                .ok()
+                .zip(i64::try_from(bytes).ok())
+                .and_then(|(count, bytes)| count.checked_mul(bytes))
+                .ok_or_else(|| ChainError::InternalError("RAM inventory overflow".into()))
+        };
+
+        let contract_kv = checked_add(
+            count_bytes(raw.contract_kv_rows, billable_size_v::<KeyValueObject>())?,
+            inventory_bytes(raw.contract_kv_value_bytes)?,
+        )?;
+        let code = inventory_bytes(raw.code_bytes)?
+            .checked_mul(i64::from(SETCODE_RAM_BYTES_MULTIPLIER))
+            .ok_or_else(|| ChainError::InternalError("RAM inventory overflow".into()))?;
+
+        Ok(AccountRamBillingBreakdown {
+            account: if raw.account_exists {
+                OVERHEAD_PER_ACCOUNT_RAM_BYTES as i64
+            } else {
+                0
+            },
+            abi: inventory_bytes(raw.abi_bytes)?,
+            code,
+            permissions,
+            permission_links: count_bytes(
+                raw.permission_links,
+                u64::try_from(PERMISSION_LINK_OBJECT_BILLABLE).map_err(|_| {
+                    ChainError::InternalError("negative permission-link RAM cost".into())
+                })?,
+            )?,
+            contract_tables: count_bytes(raw.contract_tables, billable_size_v::<TableObject>())?,
+            contract_kv,
+            contract_idx64: count_bytes(
+                raw.contract_idx64_rows,
+                billable_size_v::<Index64Object>(),
+            )?,
+            contract_idx128: count_bytes(
+                raw.contract_idx128_rows,
+                billable_size_v::<Index128Object>(),
+            )?,
+            contract_idx256: count_bytes(
+                raw.contract_idx256_rows,
+                billable_size_v::<Index256Object>(),
+            )?,
+            contract_idx_double: count_bytes(
+                raw.contract_idx_double_rows,
+                billable_size_v::<IndexDoubleObject>(),
+            )?,
+            contract_idx_long_double: count_bytes(
+                raw.contract_idx_long_double_rows,
+                billable_size_v::<IndexLongDoubleObject>(),
+            )?,
+            deferred,
+        })
+    }
+
+    /// Repair a superseded offline replay checkpoint by replacing exactly the
+    /// expected stored RAM counter with the live-object inventory total. The
+    /// compare-and-set guard prevents this from becoming a general limit
+    /// bypass, and ordinary VM execution never calls it.
+    pub fn repair_xpr_replay_ram_usage_from_inventory(
+        &self,
+        account_name: u64,
+        expected_stored: i64,
+    ) -> Result<i64, ChainError> {
+        let represented = self.account_ram_billing_breakdown(account_name)?.total()?;
+        let expected_stored = u64::try_from(expected_stored).map_err(|_| {
+            ChainError::InternalError("expected RAM usage must be non-negative".into())
+        })?;
+        let replacement = u64::try_from(represented).map_err(|_| {
+            ChainError::InternalError("represented RAM usage must be non-negative".into())
+        })?;
+        self.backend
+            .repair_account_ram_usage(account_name, expected_stored, replacement)
+            .map_err(|error| ChainError::InternalError(format!("XPR RAM repair: {error:?}")))?;
+        Ok(represented)
     }
 
     pub fn get_account_net_usage_average_window(&self) -> Result<u32, ChainError> {

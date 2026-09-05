@@ -45,7 +45,10 @@ use pulsevm_core::{
     id::Id,
     mempool::Mempool,
     name::Name,
-    transaction::TransactionStatus,
+    transaction::{
+        Action,
+        TransactionStatus,
+    },
 };
 use pulsevm_serialization::Read as PulseRead;
 use serde_json::json;
@@ -403,8 +406,20 @@ fn dump_block(block_num: u32, block: &SignedBlock) {
     }
 }
 
-fn block_mentions_account(block: &SignedBlock, account: Name) -> bool {
+fn action_mentions_account(action: &Action, account: Name) -> bool {
     let encoded = account.as_u64().to_le_bytes();
+    action.account() == &account
+        || action
+            .authorization()
+            .iter()
+            .any(|level| level.actor == account)
+        || action
+            .data()
+            .windows(encoded.len())
+            .any(|window| window == encoded)
+}
+
+fn block_mentions_account(block: &SignedBlock, account: Name) -> bool {
     block.transactions.iter().any(|receipt| {
         receipt.packed_trx().is_some_and(|packed| {
             let transaction = packed.get_transaction();
@@ -412,19 +427,35 @@ fn block_mentions_account(block: &SignedBlock, account: Name) -> bool {
                 .context_free_actions
                 .iter()
                 .chain(&transaction.actions)
-                .any(|action| {
-                    action.account() == &account
-                        || action
-                            .authorization()
-                            .iter()
-                            .any(|level| level.actor == account)
-                        || action
-                            .data()
-                            .windows(encoded.len())
-                            .any(|window| window == encoded)
-                })
+                .any(|action| action_mentions_account(action, account))
         })
     })
+}
+
+fn dump_matching_actions(block_num: u32, block: &SignedBlock, account: Name) {
+    for (receipt_index, receipt) in block.transactions.iter().enumerate() {
+        let Some(packed) = receipt.packed_trx() else {
+            continue;
+        };
+        let transaction = packed.get_transaction();
+        for (action_index, action) in transaction
+            .context_free_actions
+            .iter()
+            .chain(&transaction.actions)
+            .enumerate()
+        {
+            if action_mentions_account(action, account) {
+                eprintln!(
+                    "source block {block_num} receipt {receipt_index} action {action_index}: {}::{} auth={:?} data_bytes={} data_hex={}",
+                    action.account(),
+                    action.name(),
+                    action.authorization(),
+                    action.data().len(),
+                    hex::encode(action.data())
+                );
+            }
+        }
+    }
 }
 
 fn setcode_payload(data: &[u8]) -> Option<(Name, u8, u8, &[u8])> {
@@ -526,6 +557,10 @@ async fn main() -> Result<()> {
     let trace_ram_account = env::var("XPR_REPLAY_TRACE_RAM_ACCOUNT")
         .ok()
         .map(|value| Name::from_str(&value).context("invalid XPR_REPLAY_TRACE_RAM_ACCOUNT"))
+        .transpose()?;
+    let audit_ram_account = env::var("XPR_REPLAY_AUDIT_RAM_ACCOUNT")
+        .ok()
+        .map(|value| Name::from_str(&value).context("invalid XPR_REPLAY_AUDIT_RAM_ACCOUNT"))
         .transpose()?;
     let profile_replay = env::var_os("XPR_REPLAY_PROFILE").is_some();
     let checkpoint_interval = env::var("XPR_REPLAY_CHECKPOINT_INTERVAL")
@@ -673,6 +708,34 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Scan only packed transaction data and avoid opening the multi-gigabyte
+    // Arena checkpoint. This is suitable for parallel historical audits where
+    // each worker owns a disjoint block range.
+    if let Ok(account) = env::var("XPR_REPLAY_SCAN_ACCOUNT") {
+        let account = Name::from_str(&account).context("invalid XPR_REPLAY_SCAN_ACCOUNT")?;
+        let final_block = debug_block
+            .context("XPR_REPLAY_SCAN_ACCOUNT requires XPR_REPLAY_DEBUG_BLOCK=<height>")?;
+        let first_block = env::var("XPR_REPLAY_INSPECT_FROM")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .context("XPR_REPLAY_INSPECT_FROM must be a uint32")
+            })
+            .transpose()?
+            .unwrap_or(final_block);
+        if first_block > final_block || final_block > source_last {
+            bail!("requested account scan is outside the source block log");
+        }
+        for block_num in first_block..=final_block {
+            let packed = source.packed_block(block_num)?;
+            let block = SignedBlock::read(&packed, &mut 0)
+                .map_err(|error| anyhow::anyhow!("decode source block {block_num}: {error}"))?;
+            dump_matching_actions(block_num, &block, account);
+        }
+        return Ok(());
+    }
+
     let chain_id = Id::from_str(XPR_CHAIN_ID).expect("constant XPR chain id is valid");
     let config = serde_json::to_vec(&json!({
         "system_account": "eosio",
@@ -749,13 +812,17 @@ async fn main() -> Result<()> {
             .ok()
             .map(|value| Name::from_str(&value).context("invalid XPR_REPLAY_INSPECT_ACCOUNT"))
             .transpose()?;
+        let matches_only = env::var_os("XPR_REPLAY_INSPECT_MATCHES_ONLY").is_some();
         for inspected_block in first_block..=block_num {
             let block = controller
                 .parse_block(&source.packed_block(inspected_block)?)
                 .map_err(|error| {
                     anyhow::anyhow!("decode source block {inspected_block}: {error}")
                 })?;
-            if inspect_account.is_none_or(|account| block_mentions_account(&block, account)) {
+            if matches_only && let Some(account) = inspect_account {
+                dump_matching_actions(inspected_block, &block, account);
+            } else if inspect_account.is_none_or(|account| block_mentions_account(&block, account))
+            {
                 dump_block(inspected_block, &block);
             }
         }
@@ -863,6 +930,21 @@ async fn main() -> Result<()> {
             .database()
             .arena_account_ram_usage(account.as_u64())
     });
+    let initial_ram_residual = audit_ram_account
+        .map(|account| -> Result<i64> {
+            let stored = controller.database().get_account_ram_usage(account.as_u64())?;
+            let represented = controller
+                .database()
+                .account_ram_billing_breakdown(account.as_u64())?
+                .total()?;
+            let residual = stored - represented;
+            eprintln!(
+                "RAM inventory baseline at block {}: account={account} stored={stored} represented={represented} residual={residual}",
+                start - 1
+            );
+            Ok(residual)
+        })
+        .transpose()?;
     while block_num <= last {
         let signature_wait_started = Instant::now();
         let batch = signature_receiver
@@ -924,6 +1006,25 @@ async fn main() -> Result<()> {
             }
 
             if block_num % checkpoint_interval == 0 || block_num == last {
+                if let Some(account) = audit_ram_account {
+                    let stored = controller
+                        .database()
+                        .get_account_ram_usage(account.as_u64())?;
+                    let represented = controller
+                        .database()
+                        .account_ram_billing_breakdown(account.as_u64())?
+                        .total()?;
+                    let residual = stored - represented;
+                    eprintln!(
+                        "RAM inventory audit at block {block_num}: account={account} stored={stored} represented={represented} residual={residual}"
+                    );
+                    if Some(residual) != initial_ram_residual {
+                        bail!(
+                            "RAM inventory residual changed for {account} at or before block {block_num}: {:?} -> {residual}",
+                            initial_ram_residual
+                        );
+                    }
+                }
                 // Bulk replay defers the per-block block-log durability barrier.
                 // Sync history first, then persist Arena state: after a crash the
                 // log can be ahead of the checkpoint (and safely rewound), never

@@ -15,9 +15,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .unwrap_or_else(|| "xpr_account_resource_dump".into());
     let values: Vec<String> = args.collect();
-    if values.len() != 2 {
-        return Err(format!("Usage: {program} <arena-dir> <account>").into());
+    if values.len() != 2 && values.len() != 4 {
+        return Err(format!(
+            "Usage: {program} <arena-dir> <account> [--repair-expect <stored-bytes>]"
+        )
+        .into());
     }
+    let repair_expected = if values.len() == 4 {
+        if values[2] != "--repair-expect" {
+            return Err("third argument must be --repair-expect".into());
+        }
+        Some(values[3].parse::<i64>()?)
+    } else {
+        None
+    };
 
     let database = Database::new(&values[0], 0).map_err(io::Error::other)?;
     let account = Name::from_str(&values[1])?;
@@ -42,6 +53,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         net_weight,
         cpu_weight,
     );
+    let billing = database.account_ram_billing_breakdown(account.as_u64())?;
+    let represented = billing.total()?;
+    println!(
+        "ram_inventory total={} residual={} account={} abi={} code={} permissions={} permission_links={} contract_tables={} contract_kv={} idx64={} idx128={} idx256={} idx_double={} idx_long_double={} deferred={}",
+        represented,
+        ram_usage - represented,
+        billing.account,
+        billing.abi,
+        billing.code,
+        billing.permissions,
+        billing.permission_links,
+        billing.contract_tables,
+        billing.contract_kv,
+        billing.contract_idx64,
+        billing.contract_idx128,
+        billing.contract_idx256,
+        billing.contract_idx_double,
+        billing.contract_idx_long_double,
+        billing.deferred,
+    );
     let deferred: Vec<_> = database
         .arena_deferred_transactions()
         .into_iter()
@@ -58,6 +89,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             transaction.delay_until,
             transaction.expiration,
             transaction.published,
+        );
+    }
+    if let Some(expected) = repair_expected {
+        let repaired =
+            database.repair_xpr_replay_ram_usage_from_inventory(account.as_u64(), expected)?;
+        database.close()?;
+        println!(
+            "ram_repair account={} expected={} repaired={} residual=0",
+            account, expected, repaired
         );
     }
     Ok(())

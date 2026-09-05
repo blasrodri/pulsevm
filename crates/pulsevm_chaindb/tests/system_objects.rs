@@ -144,6 +144,19 @@ fn ram_usage_accumulates_and_reverts_signed() {
 }
 
 #[test]
+fn offline_ram_repair_is_compare_and_set() {
+    let s = db();
+    s.initialize_account_resource_limits(1).unwrap();
+    s.add_pending_ram_usage(1, 500).unwrap();
+
+    assert!(s.repair_account_ram_usage(1, 499, 300).is_err());
+    assert_eq!(s.account_ram_usage(1), Some(500));
+
+    s.repair_account_ram_usage(1, 500, 300).unwrap();
+    assert_eq!(s.account_ram_usage(1), Some(300));
+}
+
+#[test]
 fn transaction_dedup_and_expiry() {
     let s = db();
     let a = [1u8; 32];
