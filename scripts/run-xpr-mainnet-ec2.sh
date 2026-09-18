@@ -74,6 +74,8 @@ Environment:
   PULSEVM_PRESERVE_IMPORTED_AUTHORITY=true
                                 Boot the canonical authority unchanged. The supplied
                                 producer key must then be the real matching key.
+  PULSEVM_STATE_HISTORY_ENABLED Enable SHiP traces/deltas for post-migration
+                                blocks (default: true; required by Hyperion).
 
 For a raw snapshot, XPR_NODEOS must already be rebuilt from the pinned XPR_CORE
 revision with the deferred-sidecar plugin. This command deliberately boots from

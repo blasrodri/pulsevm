@@ -1,0 +1,7 @@
+services:
+  indexer:
+    network_mode: host
+
+  api:
+    network_mode: host
+    ports: !reset []

@@ -1,0 +1,22 @@
+[Unit]
+Description=Cloudflare tunnel for the PulseVM Hyperion status endpoint
+Wants=network-online.target pulsevm-xpr-status.service
+After=network-online.target pulsevm-xpr-status.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8080
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

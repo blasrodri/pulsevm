@@ -13,6 +13,8 @@
 #     of authoring normal Arena genesis state.
 #   * PULSEVM_GENESIS_PATH (optional) — genesis JSON to use. Set this to
 #     tools/xpr-chainbase-export/xpr-mainnet-genesis.json for XPR Mainnet.
+#   * PULSEVM_STATE_HISTORY_ENABLED (optional) — emit SHiP traces and deltas;
+#     defaults to true and must remain true for Hyperion integration tests.
 #   * go, protoc, and LLVM 22 (`LLVM_SYS_221_PREFIX`) for the plugin build.
 #
 # This script automates the deterministic setup (build + stage the plugin,
@@ -101,6 +103,7 @@ PRODUCER_NAME="${PULSEVM_PRODUCER_NAME:-pulse}"
 PRODUCER_KEY="${PULSEVM_PRODUCER_KEY:-PVT_K1_2pjSqJxTbRHq8h8aHHTux81Ypscb36Q2syB8UJbZcUmxbfZdnT}"
 SYSTEM_ACCOUNT="${PULSEVM_SYSTEM_ACCOUNT:-pulse}"
 NATIVE_SYSTEM_CONTRACT="${PULSEVM_NATIVE_SYSTEM_CONTRACT:-true}"
+STATE_HISTORY_ENABLED="${PULSEVM_STATE_HISTORY_ENABLED:-true}"
 if [[ ! -f "$GENESIS_PATH" ]]; then
   echo "error: genesis does not exist: $GENESIS_PATH" >&2
   exit 1
@@ -112,15 +115,23 @@ case "$NATIVE_SYSTEM_CONTRACT" in
     exit 1
     ;;
 esac
+case "$STATE_HISTORY_ENABLED" in
+  true|false) ;;
+  *)
+    echo "error: PULSEVM_STATE_HISTORY_ENABLED must be true or false" >&2
+    exit 1
+    ;;
+esac
 # Always pass a node config. Without this field, metal-network-runner sends an
 # empty config to the VM on clean (non-migration) starts, which fails before
 # controller initialization with an opaque JSON EOF error.
 CHAIN_CONFIG="$(jq -cn \
   --arg system_account "$SYSTEM_ACCOUNT" \
   --argjson native_system_contract "$NATIVE_SYSTEM_CONTRACT" \
+  --argjson state_history_enabled "$STATE_HISTORY_ENABLED" \
   --arg producer_name "$PRODUCER_NAME" \
   --arg producer_key "$PRODUCER_KEY" \
-  '{system_account: $system_account, native_system_contract: $native_system_contract, producer_name: $producer_name, producer_key: $producer_key}')"
+  '{system_account: $system_account, native_system_contract: $native_system_contract, state_history_enabled: $state_history_enabled, producer_name: $producer_name, producer_key: $producer_key}')"
 BLOCKCHAIN_SPECS="$(jq -cn \
   --arg genesis "$GENESIS_PATH" \
   --arg chain_config "$CHAIN_CONFIG" \
@@ -149,7 +160,8 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
     --arg producer_name "$PRODUCER_NAME" \
     --arg system_account "$SYSTEM_ACCOUNT" \
     --argjson native_system_contract "$NATIVE_SYSTEM_CONTRACT" \
-    '{system_account: $system_account, native_system_contract: $native_system_contract, producer_name: $producer_name, producer_key: $producer_key, migration_checkpoint: $checkpoint, migration_manifest: $manifest}')"
+    --argjson state_history_enabled "$STATE_HISTORY_ENABLED" \
+    '{system_account: $system_account, native_system_contract: $native_system_contract, state_history_enabled: $state_history_enabled, producer_name: $producer_name, producer_key: $producer_key, migration_checkpoint: $checkpoint, migration_manifest: $manifest}')"
   BLOCKCHAIN_SPECS="$(jq -cn \
     --arg genesis "$MIGRATION_GENESIS" \
     --arg chain_config "$CHAIN_CONFIG" \
